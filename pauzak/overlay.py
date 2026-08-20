@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from typing import NamedTuple
+
 import cairo
 import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gsk", "4.0")
 gi.require_version("Graphene", "1.0")
-from gi.repository import Gdk, GObject, Graphene, Gsk, Gtk  # noqa: E402
+from gi.repository import Gdk, Gio, GLib, GObject, Graphene, Gsk, Gtk  # noqa: E402
 
 from . import x11
 
@@ -21,12 +24,58 @@ WHEEL_STEP_SLOW = 1.04
 MIN_ZOOM, MAX_ZOOM = 0.05, 32.0
 BORDER_WIDTH = 1.0
 BORDER_COLOR = "#e01b24"  # Adwaita red; reads against most image content
+GEOMETRY_SETTLE_MS = 120  # how long to give the WM before reading a move back
+# Snap guides: the image's own edge, the edge underneath it, and the pair that
+# was taken. Blue and green are dashed and come in twos, so a near miss reads
+# as two lines a few pixels apart rather than as something in the image.
+GUIDE_IMAGE_COLOR = "#3584e4"
+GUIDE_TARGET_COLOR = "#26a269"
+GUIDE_LOCKED_COLOR = "#f6d32d"
+GUIDE_DASH_ON, GUIDE_DASH_OFF = 7.0, 5.0
+GUIDE_LINGER_MS = 5000  # how long guides stay up after a scan
+
+
+def parse_color(spec: str) -> Gdk.RGBA:
+    """The colour a string names, or the border's own colour if it names none."""
+    rgba = Gdk.RGBA()
+    if not rgba.parse(spec):
+        rgba.parse(BORDER_COLOR)
+    return rgba
 
 
 def default_border_color() -> Gdk.RGBA:
-    rgba = Gdk.RGBA()
-    rgba.parse(BORDER_COLOR)
-    return rgba
+    return parse_color(BORDER_COLOR)
+
+
+_TRANSPARENT = Gdk.RGBA()  # a fresh RGBA is already all zeroes
+_GUIDE_COLORS = {
+    "image": parse_color(GUIDE_IMAGE_COLOR),
+    "target": parse_color(GUIDE_TARGET_COLOR),
+    "locked": parse_color(GUIDE_LOCKED_COLOR),
+}
+
+
+class State(NamedTuple):
+    """Everything about an overlay that undo has to be able to put back.
+
+    A plain value, compared field by field: two equal states mean nothing
+    happened and there is nothing to record. The border colour is kept as its
+    string form because Gdk.RGBA does not compare by value.
+    """
+
+    x: int
+    y: int
+    width: int
+    height: int
+    pan_x: float
+    pan_y: float
+    zoom: float
+    opacity: float
+    touchable: bool
+    always_on_top: bool
+    border_visible: bool
+    border_color: str
+    hidden: bool
 
 
 def screen_bounds() -> tuple[float, float, float, float] | None:
@@ -108,12 +157,24 @@ class ImageView(Gtk.Widget):
         self.image_opacity = 1.0
         self.border_visible = False
         self.border_color = default_border_color()
+        # Guides are snap.Guide values; the view only reads their fields.
+        self.guides = ()
+        self.scanning = False
         self.set_hexpand(True)
         self.set_vexpand(True)
 
     def do_snapshot(self, snapshot):  # noqa: N802  (GTK vfunc naming)
         width, height = self.get_width(), self.get_height()
         if width <= 0 or height <= 0:
+            return
+        if self.scanning:
+            # See-through for a capture, border and guides included. It has to
+            # be an explicit transparent fill rather than no nodes at all: an
+            # empty snapshot leaves the last frame standing on screen, and the
+            # capture then finds the overlay's own image looking back at it.
+            snapshot.append_color(
+                _TRANSPARENT, Graphene.Rect().init(0, 0, width, height)
+            )
             return
         snapshot.push_clip(Graphene.Rect().init(0, 0, width, height))
         snapshot.push_opacity(self.image_opacity)
@@ -122,6 +183,8 @@ class ImageView(Gtk.Widget):
         snapshot.pop()
         if self.border_visible:
             self._snapshot_border(snapshot, width, height)
+        if self.guides:
+            self._snapshot_guides(snapshot, width, height)
 
     def _snapshot_border(self, snapshot, width: int, height: int) -> None:
         """Outside the opacity push on purpose.
@@ -135,6 +198,32 @@ class ImageView(Gtk.Widget):
         outline = Gsk.RoundedRect()
         outline.init_from_rect(Graphene.Rect().init(0, 0, width, height), 0)
         snapshot.append_border(outline, [BORDER_WIDTH] * 4, [self.border_color] * 4)
+
+    def _snapshot_guides(self, snapshot, width: int, height: int) -> None:
+        """Solid where a match was taken, dashed pairs where one was possible."""
+        for guide in self.guides:
+            if guide.chosen:
+                self._guide_line(snapshot, guide, guide.image, "locked", width, height, False)
+                continue
+            self._guide_line(snapshot, guide, guide.target, "target", width, height, True)
+            self._guide_line(snapshot, guide, guide.image, "image", width, height, True)
+
+    def _guide_line(self, snapshot, guide, position, role, width, height, dashed) -> None:
+        color = _GUIDE_COLORS[role]
+        vertical = guide.axis == "x"
+        length = height if vertical else width
+        offset = round(position)
+        run = GUIDE_DASH_ON if dashed else length
+        start = 0.0
+        while start < length:
+            extent = min(run, length - start)
+            rect = (
+                Graphene.Rect().init(offset, start, 1, extent)
+                if vertical
+                else Graphene.Rect().init(start, offset, extent, 1)
+            )
+            snapshot.append_color(color, rect)
+            start += run + (GUIDE_DASH_OFF if dashed else 0.0)
 
     def _filter(self):
         return Gsk.ScalingFilter.LINEAR if self.zoom >= 1.0 else Gsk.ScalingFilter.TRILINEAR
@@ -198,26 +287,48 @@ class OverlayWindow(Gtk.Window):
 
     __gsignals__ = {"state-changed": (GObject.SignalFlags.RUN_FIRST, None, ())}
 
-    def __init__(self, application, texture: Gdk.Texture, name: str):
+    def __init__(
+        self,
+        application,
+        texture: Gdk.Texture,
+        name: str,
+        key: int = 0,
+        state: State | None = None,
+    ):
         super().__init__(application=application, title=f"pauzak - {name}")
         self.image_name = name
+        self.key = key  # identity that survives being closed and reopened
+        self.recorder = None  # set by the panel; see _record()
         self.touchable = True
         self.always_on_top = True
         self.hidden = False
-        self._hidden_at = None
+        # Where and how big it was when it went away. An unmapped window
+        # reports a size of zero, so this is the only record of it.
+        self._hidden_rect = None
         self._xid = 0
         self._drag_last = (0, 0)
         self._drag_edge = None
         self._drag_rect = [0.0, 0.0, 0.0, 0.0]
         self._drag_pan = [0.0, 0.0]
+        self._restoring = False
+        self._edit_depth = 0
+        self._edit_before = None
+        self._requested = None  # geometry asked for but not yet confirmed
+        self._settle_timer = 0
+        self._guide_timer = 0
+        # An overlay brought back by undo has to be placed and sized once the
+        # WM has a window to place, which is not before the first map.
+        self._pending_state = state
 
         self.set_decorated(False)
         self.add_css_class("pauzak-overlay")
         self.view = ImageView(texture)
         self.set_child(self.view)
-        self.set_default_size(*self._initial_size(texture))
+        size = (state.width, state.height) if state else self._initial_size(texture)
+        self.set_default_size(*size)
 
         self._install_controllers()
+        self._install_actions()
         self.connect("realize", self._on_realize)
         self.connect("map", self._on_map)
 
@@ -247,14 +358,21 @@ class OverlayWindow(Gtk.Window):
         x11.set_skip_taskbar(self._xid, True)
         self._apply_above()
         self._apply_input_region()
-        if self._hidden_at is not None:
+        if self._hidden_rect is not None:
             # Hiding keeps the surface and its size but not its place on
             # screen: the WM re-places the window when it maps again.
-            x11.move(self._xid, *self._hidden_at)
-            self._hidden_at = None
+            x11.move(self._xid, *self._hidden_rect[:2])
+            self._hidden_rect = None
+        if self._pending_state is not None:
+            state, self._pending_state = self._pending_state, None
+            self.restore(state)
+        # Nothing notifies on a surface's first size, so the panel would still
+        # be showing the nothing it had before the window was placed and sized.
+        self._settle_later()
 
     def _on_surface_resized(self, *_args):
         self._apply_input_region()
+        self.emit("state-changed")
 
     # -- window properties -------------------------------------------------
 
@@ -263,10 +381,13 @@ class OverlayWindow(Gtk.Window):
         surface = self.get_surface()
         if surface is None:
             return
-        if self.touchable:
+        if self.touchable and not self.view.scanning:
             rect = cairo.RectangleInt(0, 0, surface.get_width(), surface.get_height())
             region = cairo.Region(rect)
         else:
+            # Nothing to hit while a capture is being taken: the window is
+            # see-through for it, and an invisible window that still swallows
+            # clicks is worse than one that is merely in the way.
             region = cairo.Region()
         surface.set_input_region(region)
 
@@ -275,55 +396,272 @@ class OverlayWindow(Gtk.Window):
             x11.set_above(self._xid, self.always_on_top)
 
     def set_touchable(self, enabled: bool) -> None:
-        self.touchable = enabled
-        self._apply_input_region()
+        with self.edit("touchable"):
+            self.touchable = enabled
+            self._apply_input_region()
         self.emit("state-changed")
 
     def set_always_on_top(self, enabled: bool) -> None:
-        self.always_on_top = enabled
-        self._apply_above()
+        with self.edit("on-top"):
+            self.always_on_top = enabled
+            self._apply_above()
         self.emit("state-changed")
 
     def set_image_opacity(self, value: float) -> None:
-        self.view.image_opacity = min(max(value, 0.0), 1.0)
-        self.view.queue_draw()
+        with self.edit("opacity"):
+            self.view.image_opacity = min(max(value, 0.0), 1.0)
+            self.view.queue_draw()
         self.emit("state-changed")
 
     def set_hidden(self, hidden: bool) -> None:
         if hidden == self.hidden:
             return
-        self.hidden = hidden
-        if hidden:
-            self._hidden_at = x11.position(self._xid)
-            self.set_visible(False)
-        else:
-            self.present()
+        with self.edit("hidden"):
+            if hidden:
+                # Read before hiding: afterwards there is nothing to read.
+                self._hidden_rect = self.geometry()
+            self.hidden = hidden
+            if hidden:
+                self.set_visible(False)
+            else:
+                self.present()
         self.emit("state-changed")
 
     def set_border_visible(self, enabled: bool) -> None:
-        self.view.border_visible = enabled
-        self.view.queue_draw()
+        with self.edit("border"):
+            self.view.border_visible = enabled
+            self.view.queue_draw()
         self.emit("state-changed")
 
     def set_border_color(self, color: Gdk.RGBA) -> None:
-        self.view.border_color = color
-        self.view.queue_draw()
+        with self.edit("border-color"):
+            self.view.border_color = color
+            self.view.queue_draw()
         self.emit("state-changed")
 
     def set_zoom(self, zoom: float) -> None:
-        self.view.set_zoom(zoom)
+        with self.edit("zoom"):
+            self.view.set_zoom(zoom)
+        self.emit("state-changed")
+
+    def set_image_pan(self, pan_x: float, pan_y: float) -> None:
+        with self.edit("pan"):
+            self.view.set_pan(pan_x, pan_y)
         self.emit("state-changed")
 
     def zoom_one_to_one(self) -> None:
-        self.set_zoom(1.0)
+        with self.edit():
+            self.set_zoom(1.0)
 
     def zoom_to_fit(self) -> None:
-        self.view.center()
-        self.set_zoom(self.view.fit_zoom())
+        with self.edit():
+            self.view.center()
+            self.set_zoom(self.view.fit_zoom())
 
     def center_image(self) -> None:
-        self.view.center()
+        with self.edit():
+            self.view.center()
         self.emit("state-changed")
+
+    # -- lining up with what is underneath ---------------------------------
+
+    def begin_scan(self) -> None:
+        """Stop drawing, so a screen capture sees through to the backdrop.
+
+        Deliberately not the opacity setting: this is not a change to the
+        overlay's state, so neither the panel nor undo should hear about it.
+        """
+        self.view.scanning = True
+        self.view.queue_draw()
+        self._apply_input_region()
+
+    def end_scan(self) -> None:
+        self.view.scanning = False
+        self.view.queue_draw()
+        self._apply_input_region()
+
+    def apply_alignment(self, alignment) -> None:
+        """Pan by what a scan found, and leave its guides up for a moment."""
+        with self.edit("align"):
+            self.view.set_pan(
+                self.view.pan_x + alignment.dx, self.view.pan_y + alignment.dy
+            )
+        self.show_guides(alignment.guides)
+        self.emit("state-changed")
+
+    def show_guides(self, guides) -> None:
+        self.view.guides = tuple(guides)
+        self.view.queue_draw()
+        if self._guide_timer:
+            GLib.source_remove(self._guide_timer)
+        self._guide_timer = GLib.timeout_add(GUIDE_LINGER_MS, self._on_guides_expired)
+
+    def _on_guides_expired(self):
+        self._guide_timer = 0
+        self.view.guides = ()
+        self.view.queue_draw()
+        return GLib.SOURCE_REMOVE
+
+    def window_position(self) -> tuple[int, int]:
+        """Root coordinates of the window's top-left corner.
+
+        While the overlay is hidden there is no window on screen to ask, and
+        _hidden_rect is the rectangle it will come back to.
+        """
+        if self._hidden_rect is not None:
+            return self._hidden_rect[:2]
+        return x11.position(self._xid) if self._xid else (0, 0)
+
+    def geometry(self) -> tuple[int, int, int, int]:
+        """Position and size, preferring one that has been asked for.
+
+        Moving and resizing are requests to the WM, so between the request and
+        the WM acting on it X still reports the old rectangle. Reading that back
+        into the panel would put the number the user just typed back to what it
+        was, which is worse than a reading that is briefly optimistic.
+        """
+        if self._requested is not None:
+            return self._requested
+        if self._hidden_rect is not None:
+            return self._hidden_rect
+        return (*self.window_position(), self.get_width(), self.get_height())
+
+    def set_window_geometry(self, x: float, y: float, width: float, height: float) -> None:
+        """Place and size the window from outside, e.g. from the panel's spins.
+
+        The move is a request to the WM, so what goes into the history is the
+        geometry asked for rather than one read back before the WM has acted on
+        it, and the panel is told to look again once it has.
+        """
+        width, height = max(MIN_SIZE, round(width)), max(MIN_SIZE, round(height))
+        x, y = self._on_screen(round(x), round(y), width, height)
+        before = self.snapshot()
+        after = before._replace(x=x, y=y, width=width, height=height)
+        self._record(before, after, "geometry")
+        self._apply_window_geometry(after)
+        self.emit("state-changed")
+
+    def _on_screen(self, x: int, y: int, width: int, height: int) -> tuple[int, int]:
+        """Keep a typed rectangle reachable, the way a drag is kept reachable.
+
+        A number typed into the panel can otherwise put the window somewhere
+        there is no screen, and an overlay that cannot be seen cannot be
+        dragged back either.
+        """
+        bounds = screen_bounds()
+        if bounds is None:
+            return x, y
+        left, top, right, bottom = bounds
+        return (
+            round(_clamp_span(x, width, left, right)),
+            round(_clamp_span(y, height, top, bottom)),
+        )
+
+    def _apply_window_geometry(self, state: State) -> None:
+        if self.hidden:
+            # An unmapped window is not the WM's to place; the map path reads
+            # the position back out of _hidden_rect instead.
+            self._hidden_rect = (
+                state.x, state.y, max(MIN_SIZE, state.width), max(MIN_SIZE, state.height)
+            )
+            return
+        width, height = max(MIN_SIZE, state.width), max(MIN_SIZE, state.height)
+        if self.geometry() == (state.x, state.y, width, height):
+            return
+        self._requested = (state.x, state.y, width, height)
+        x11.move_resize(self._xid, state.x, state.y, width, height)
+        self._settle_later()
+
+    def _settle_later(self) -> None:
+        """Arm the read-back, replacing any still pending.
+
+        Without replacing it, a timer armed for an earlier move fires in the
+        middle of a later one and hands the reading back to X too early, which
+        puts the number the user has just typed back to what it was.
+        """
+        if self._settle_timer:
+            GLib.source_remove(self._settle_timer)
+        self._settle_timer = GLib.timeout_add(GEOMETRY_SETTLE_MS, self._on_geometry_settled)
+
+    def _on_geometry_settled(self):
+        """Hand the reading back to X once the WM has had time to act.
+
+        A window's position is not a property anything notifies on, so a move
+        pauzak asked for has to be read back rather than waited for -- and if
+        the WM turned the request down, this is when that shows.
+        """
+        self._settle_timer = 0
+        self._requested = None
+        self.emit("state-changed")
+        return GLib.SOURCE_REMOVE
+
+    # -- undo bookkeeping --------------------------------------------------
+
+    def snapshot(self) -> State:
+        x, y, width, height = self.geometry()
+        return State(
+            x=x,
+            y=y,
+            width=width,
+            height=height,
+            pan_x=self.view.pan_x,
+            pan_y=self.view.pan_y,
+            zoom=self.view.zoom,
+            opacity=self.view.image_opacity,
+            touchable=self.touchable,
+            always_on_top=self.always_on_top,
+            border_visible=self.view.border_visible,
+            border_color=self.view.border_color.to_string(),
+            hidden=self.hidden,
+        )
+
+    def restore(self, state: State) -> None:
+        """Put the overlay back into `state`, recording nothing on the way."""
+        self._restoring = True
+        try:
+            self.set_touchable(state.touchable)
+            self.set_always_on_top(state.always_on_top)
+            self.set_image_opacity(state.opacity)
+            self.set_border_visible(state.border_visible)
+            self.set_border_color(parse_color(state.border_color))
+            self.set_zoom(state.zoom)
+            self.set_image_pan(state.pan_x, state.pan_y)
+            if self.hidden and not state.hidden:
+                # Mapping again re-places the window from _hidden_rect, so aim
+                # that at where the state wants it, not where it went away from.
+                self._hidden_rect = (
+                    state.x, state.y, max(MIN_SIZE, state.width), max(MIN_SIZE, state.height)
+                )
+            self.set_hidden(state.hidden)
+            self._apply_window_geometry(state)
+        finally:
+            self._restoring = False
+        self.emit("state-changed")
+
+    def begin_edit(self) -> None:
+        """Open a step. Nestable, and the outermost one decides its tag."""
+        if self._edit_depth == 0:
+            self._edit_before = self.snapshot()
+        self._edit_depth += 1
+
+    def end_edit(self, tag: str | None = None) -> None:
+        self._edit_depth = max(0, self._edit_depth - 1)
+        if self._edit_depth or self._edit_before is None:
+            return
+        before, self._edit_before = self._edit_before, None
+        self._record(before, self.snapshot(), tag)
+
+    @contextmanager
+    def edit(self, tag: str | None = None):
+        self.begin_edit()
+        try:
+            yield
+        finally:
+            self.end_edit(tag)
+
+    def _record(self, before: State, after: State, tag: str | None) -> None:
+        if self.recorder is not None and not self._restoring and not self._edit_depth:
+            self.recorder(self, before, after, tag)
 
     # -- input -------------------------------------------------------------
 
@@ -366,6 +704,13 @@ class OverlayWindow(Gtk.Window):
         state = gesture.get_current_event_state()
         panning = bool(state & Gdk.ModifierType.CONTROL_MASK)
         self._drag_edge = None if panning else self._edge_at(start_x, start_y)
+        # A drag is one thing to undo however many motion events it takes, and
+        # Ctrl may go down or up mid-drag, so the step stays untagged rather
+        # than claiming to be about the window or about the image. The depth is
+        # reset first: a gesture cancelled without its drag-end would otherwise
+        # leave an edit open, and an open edit records nothing ever again.
+        self._edit_depth = 0
+        self.begin_edit()
 
         self._drag_pan = [self.view.pan_x, self.view.pan_y]
 
@@ -402,6 +747,8 @@ class OverlayWindow(Gtk.Window):
 
     def _on_drag_end(self, *_args):
         self._drag_edge = None
+        self.end_edit()
+        self._settle_later()
 
     def _pan_by(self, dx: float, dy: float, snap: bool) -> None:
         """Pan the image, keeping the un-snapped pan in the drag state.
@@ -418,6 +765,7 @@ class OverlayWindow(Gtk.Window):
         if snap:
             pan = self.view.snap_pan(*pan, SNAP_DISTANCE)
         self.view.set_pan(*pan)
+        self.emit("state-changed")
 
     def _move_by(self, dx: float, dy: float) -> None:
         """Move the window, clamping each axis on its own.
@@ -437,6 +785,8 @@ class OverlayWindow(Gtk.Window):
             y = _clamp_span(y, self._drag_rect[3], top, bottom)
         self._drag_rect[0], self._drag_rect[1] = x, y
         x11.move(self._xid, x, y)
+        self._requested = tuple(int(value) for value in self._drag_rect)
+        self.emit("state-changed")
 
     def _resize_by(self, edge: str, dx: float, dy: float) -> None:
         x, y, width, height = self._drag_rect
@@ -452,12 +802,15 @@ class OverlayWindow(Gtk.Window):
             height = max(MIN_SIZE, height + dy)
         self._drag_rect = [x, y, width, height]
         x11.move_resize(self._xid, x, y, width, height)
+        self._requested = tuple(int(value) for value in self._drag_rect)
+        self.emit("state-changed")
 
     def _on_scroll(self, controller, _dx, dy):
         state = controller.get_current_event_state()
         step = WHEEL_STEP_SLOW if state & Gdk.ModifierType.SHIFT_MASK else WHEEL_STEP
         x, y = self._scroll_anchor(controller)
-        self.view.zoom_at(x, y, self.view.zoom * (step**-dy))
+        with self.edit("zoom"):
+            self.view.zoom_at(x, y, self.view.zoom * (step**-dy))
         self.emit("state-changed")
         return Gdk.EVENT_STOP
 
@@ -470,7 +823,29 @@ class OverlayWindow(Gtk.Window):
                 return x, y
         return self.get_width() / 2, self.get_height() / 2
 
+    def _install_actions(self):
+        """The application's accelerators drive these.
+
+        An overlay is a plain window rather than a GtkApplicationWindow, so it
+        has no action map of its own -- but an inserted action group is enough
+        for the accels declared in app.py to find their way here, which keeps
+        one table of shortcuts instead of a second copy spelled out in keyvals.
+        """
+        actions = Gio.SimpleActionGroup()
+        for name, run in (
+            ("undo", lambda: self.get_application().undo.undo()),
+            ("redo", lambda: self.get_application().undo.redo()),
+            ("align", lambda: self.get_application().aligner.align(self)),
+            ("close-overlay", self.close),
+        ):
+            action = Gio.SimpleAction.new(name, None)
+            action.connect("activate", lambda *_args, run=run: run())
+            actions.add_action(action)
+        self.insert_action_group("win", actions)
+
     def _on_key_pressed(self, _controller, keyval, _keycode, _state):
+        # Escape stays a key rather than an accelerator: bound application-wide
+        # it would also close the selected overlay from the panel.
         if keyval == Gdk.KEY_Escape:
             self.close()
             return Gdk.EVENT_STOP

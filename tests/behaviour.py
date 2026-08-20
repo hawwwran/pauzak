@@ -38,11 +38,14 @@ gi.require_version("Adw", "1")
 from gi.repository import Gdk, GLib, Gio, Gtk  # noqa: E402
 from PIL import Image, ImageDraw  # noqa: E402
 
-from pauzak import history, imagesrc, x11  # noqa: E402
+from pauzak import history, imagesrc, snap, x11  # noqa: E402
 from pauzak.app import PauzakApplication  # noqa: E402
 from pauzak.overlay import SNAP_DISTANCE, screen_bounds  # noqa: E402
 
 IMAGE = os.path.join(TMP, "grid.png")
+PATTERN = os.path.join(TMP, "pattern.png")
+PATTERN_SIZE = (420, 300)
+PATTERN_COLS, PATTERN_ROWS = (40, 150, 330), (30, 120, 250)
 SHOT = os.path.join(TMP, "screen.png")
 RECENTS = [os.path.join(TMP, f"recent-{n}.png") for n in range(4)]
 results: list[tuple[bool, str, str]] = []
@@ -51,6 +54,17 @@ results: list[tuple[bool, str, str]] = []
 def check(name: str, ok: bool, detail: str = "") -> None:
     results.append((bool(ok), name, detail))
     print(f"{'PASS' if ok else 'FAIL'}  {name}  {detail}", flush=True)
+
+
+def make_pattern() -> None:
+    """A grid of hard edges, the thing an alignment scan is supposed to find."""
+    image = Image.new("RGB", PATTERN_SIZE, (250, 250, 252))
+    draw = ImageDraw.Draw(image)
+    for x in PATTERN_COLS:
+        draw.rectangle([x, 0, x + 1, PATTERN_SIZE[1]], fill=(90, 90, 100))
+    for y in PATTERN_ROWS:
+        draw.rectangle([0, y, PATTERN_SIZE[0], y + 1], fill=(90, 90, 100))
+    image.save(PATTERN)
 
 
 def make_image() -> None:
@@ -789,7 +803,380 @@ class Suite(PauzakApplication):
         check("the eye button follows a change it did not make",
               row is not None and row.visibility_button.get_active())
         self.win.activate_action("win.toggle-hidden", None)
-        return self._then(self.finish, 900)
+        return self._then(self.numbers, 900)
+
+    # -- the panel's numbers -----------------------------------------------
+
+    def numbers(self):
+        """The position, size and offset spins, read and written."""
+        self.win._sync_controls()
+        shown = tuple(
+            int(spin.get_value())
+            for spin in self.win.position_spins + self.win.size_spins
+        )
+        check("the spins show the window's real geometry", shown == geom(self.overlay._xid),
+              f"{shown} vs {geom(self.overlay._xid)}")
+        self.placed = (420, 260, 380, 240)
+        self.was = geom(self.overlay._xid)
+        self.win.position_spins[0].set_value(self.placed[0])
+        self.win.position_spins[1].set_value(self.placed[1])
+        return self._then(self.numbers_size, 900)
+
+    def numbers_size(self):
+        check("editing the position spins moves the window",
+              geom(self.overlay._xid)[:2] == self.placed[:2], geom(self.overlay._xid))
+        self.win.size_spins[0].set_value(self.placed[2])
+        self.win.size_spins[1].set_value(self.placed[3])
+        return self._then(self.numbers_check, 900)
+
+    def numbers_check(self):
+        check("editing the size spins resizes it", geom(self.overlay._xid) == self.placed,
+              geom(self.overlay._xid))
+        self.pan_was = (self.overlay.view.pan_x, self.overlay.view.pan_y)
+        self.win.offset_spins[0].set_value(64)
+        self.win.offset_spins[1].set_value(-40)
+        check("editing the offset spins pans the image",
+              (self.overlay.view.pan_x, self.overlay.view.pan_y) == (64, -40),
+              (self.overlay.view.pan_x, self.overlay.view.pan_y))
+        return self._then(self.undo_offset, 900)
+
+    # -- undo / redo -------------------------------------------------------
+
+    def undo_offset(self):
+        """Each of the edits above went in far enough apart to be its own step,
+        so they come back off the stack one at a time and in order."""
+        self.undo.undo()
+        check("undo puts the pan back",
+              (self.overlay.view.pan_x, self.overlay.view.pan_y) == self.pan_was,
+              f"{(self.overlay.view.pan_x, self.overlay.view.pan_y)} vs {self.pan_was}")
+        self.undo.undo()
+        return self._then(self.undo_size_check, 600)
+
+    def undo_size_check(self):
+        check("undo puts the size back, and leaves the position alone",
+              geom(self.overlay._xid) == (*self.placed[:2], *self.was[2:]),
+              f"{geom(self.overlay._xid)} vs {(*self.placed[:2], *self.was[2:])}")
+        self.undo.undo()
+        return self._then(self.undo_move_check, 600)
+
+    def undo_move_check(self):
+        check("the step before that is the move", geom(self.overlay._xid) == self.was,
+              f"{geom(self.overlay._xid)} vs {self.was}")
+        self.undo.redo()
+        return self._then(self.redo_check, 600)
+
+    def redo_check(self):
+        check("redo moves it again", geom(self.overlay._xid)[:2] == self.placed[:2],
+              geom(self.overlay._xid))
+        self.undo.undo()
+        return self._then(self.undo_keys, 600)
+
+    def undo_keys(self):
+        """Ctrl+Z with the overlay focused, rather than the panel: the overlay
+        is a plain window with no action map, so it handles the keys itself."""
+        self.overlay.set_image_opacity(0.42)
+        self._activate(self.overlay._xid, self.undo_key_press)
+        return False
+
+    def undo_key_press(self):
+        def work():
+            xdo("key", "--clearmodifiers", "ctrl+z")
+            time.sleep(0.4)
+            GLib.idle_add(self.undo_key_check)
+
+        threading.Thread(target=work, daemon=True).start()
+        return False
+
+    def undo_key_check(self):
+        check("Ctrl+Z on the overlay itself undoes",
+              abs(self.overlay.view.image_opacity - 0.42) > 1e-6,
+              self.overlay.view.image_opacity)
+        restored = self.overlay.view.image_opacity
+
+        def work():
+            xdo("key", "--clearmodifiers", "ctrl+shift+z")
+            time.sleep(0.4)
+            GLib.idle_add(lambda: self.redo_key_check(restored))
+
+        threading.Thread(target=work, daemon=True).start()
+        return False
+
+    def redo_key_check(self, restored):
+        check("and Ctrl+Shift+Z redoes",
+              abs(self.overlay.view.image_opacity - 0.42) < 1e-6,
+              f"{restored} -> {self.overlay.view.image_opacity}")
+        return self._then(self.undo_close, 400)
+
+    def undo_close(self):
+        self.closed_key = self.overlay.key
+        self.closed_state = self.overlay.snapshot()
+        self.win.activate_action("win.close-overlay", None)
+        return self._then(self.undo_close_check, 700)
+
+    def undo_close_check(self):
+        check("Ctrl+W closes the overlay", self.win.overlays() == [])
+        self.undo.undo()
+        return self._then(self.undo_reopen_check, 1200)
+
+    def undo_reopen_check(self):
+        back = self.win.overlays()
+        check("undo brings a closed overlay back", len(back) == 1, len(back))
+        if not back:
+            return self._then(self.snap_math, 300)
+        self.overlay = back[0]
+        check("it keeps the identity it had, so its earlier steps still apply",
+              self.overlay.key == self.closed_key, self.overlay.key)
+        state = self.overlay.snapshot()
+        check("it comes back with its zoom, pan and opacity",
+              (state.zoom, state.pan_x, state.pan_y, state.opacity)
+              == (self.closed_state.zoom, self.closed_state.pan_x,
+                  self.closed_state.pan_y, self.closed_state.opacity),
+              f"{state} vs {self.closed_state}")
+        check("and where it was on screen",
+              abs(state.x - self.closed_state.x) <= 2 and abs(state.y - self.closed_state.y) <= 2,
+              f"{(state.x, state.y)} vs {(self.closed_state.x, self.closed_state.y)}")
+        return self._then(self.hidden_reopen, 300)
+
+    def hidden_reopen(self):
+        """An unmapped window reports no size at all, so hiding an overlay and
+        then closing it has to fall back on the rectangle remembered from when
+        it went away -- or it comes back at the image's natural size."""
+        self.hidden_size = self.overlay.geometry()[2:]
+        self.hidden_key = self.overlay.key
+        self.overlay.set_hidden(True)
+        return self._then(self.hidden_close, 800)
+
+    def hidden_close(self):
+        check("a hidden overlay still knows how big it is",
+              self.overlay.geometry()[2:] == self.hidden_size,
+              f"{self.overlay.geometry()[2:]} vs {self.hidden_size}")
+        self.overlay.close()
+        return self._then(self.hidden_undo, 800)
+
+    def hidden_undo(self):
+        self.undo.undo()
+        return self._then(self.hidden_reopen_check, 1400)
+
+    def hidden_reopen_check(self):
+        back = [o for o in self.win.overlays() if o.key == self.hidden_key]
+        check("undo brings a hidden overlay back too", bool(back))
+        if not back:
+            return self._then(self.snap_math, 300)
+        self.overlay = back[0]
+        check("at the size it had, not the image's own",
+              self.overlay.geometry()[2:] == self.hidden_size,
+              f"{self.overlay.geometry()[2:]} vs {self.hidden_size}")
+        self.overlay.set_hidden(False)
+        return self._then(self.hidden_shown_check, 1000)
+
+    def hidden_shown_check(self):
+        size = (self.overlay.get_width(), self.overlay.get_height())
+        check("and showing it puts that size on the screen", size == self.hidden_size,
+              f"{size} vs {self.hidden_size}")
+        return self._then(self.snap_math, 300)
+
+    # -- lining up with what is underneath ---------------------------------
+
+    def snap_math(self):
+        """The matching itself, on arrays rather than on the screen: a shift
+        this recovers from synthetic edges is one the scan cannot get wrong for
+        reasons of its own."""
+        if not snap.available():
+            check("numpy is installed, so aligning is available", False, "no numpy")
+            return self._then(self.finish, 300)
+
+        import numpy as np
+
+        def picture(width, height, cols, rows, thickness=2):
+            image = np.full((height, width), 240.0, dtype=np.float32)
+            for x in cols:
+                image[:, x : x + thickness] = 20.0
+            for y in rows:
+                image[y : y + thickness, :] = 20.0
+            return image
+
+        design = picture(200, 100, (50, 120, 180), (25, 75))
+        shifted = picture(200, 100, (57, 127, 187), (32, 82))
+        result = snap.align(design, (0, 0, 200, 100), (200, 100), shifted)
+        check("a known shift comes back exactly", (result.dx, result.dy) == (7.0, 7.0),
+              f"{(result.dx, result.dy)}")
+        check("and the pairs behind it are marked as taken",
+              any(guide.chosen for guide in result.guides), f"{len(result.guides)} guides")
+
+        aligned = snap.align(design, (0, 0, 200, 100), (200, 100),
+                             picture(200, 100, (50, 120, 180), (25, 75)))
+        check("something already lined up is left alone",
+              (aligned.dx, aligned.dy) == (0.0, 0.0), f"{(aligned.dx, aligned.dy)}")
+
+        # A design drawn at a quarter of its size, and a backdrop captured at
+        # twice the screen's own resolution: both go through the resampler, and
+        # point-sampling it would drop the one-pixel edges altogether.
+        big = picture(800, 400, (200, 480, 720), (100, 300), thickness=8)
+        quarter = snap.align(big, (0, 0, 200, 100), (200, 100), shifted)
+        check("a design drawn at a quarter size still matches",
+              (quarter.dx, quarter.dy) == (7.0, 7.0), f"{(quarter.dx, quarter.dy)}")
+        hidpi = picture(400, 200, (114, 254, 374), (64, 164), thickness=4)
+        scaled = snap.align(design, (0, 0, 200, 100), (200, 100), hidpi)
+        check("a backdrop captured at twice the scale still matches",
+              (scaled.dx, scaled.dy) == (7.0, 7.0), f"{(scaled.dx, scaled.dy)}")
+
+        flat = np.full((100, 200), 128.0, dtype=np.float32)
+        nothing = snap.align(design, (0, 0, 200, 100), (200, 100), flat)
+        check("a blank backdrop moves nothing and offers no guides",
+              (nothing.dx, nothing.dy, len(nothing.guides)) == (0.0, 0.0, 0),
+              f"{(nothing.dx, nothing.dy)}, {len(nothing.guides)} guides")
+        return self._then(self.align_setup)
+
+    def align_setup(self):
+        """A white window with the same grid painted on it, for the overlay to
+        find its way onto."""
+        self.pattern_at = (960, 360)
+        self.backdrop_at, self.backdrop_size = (900, 300), (700, 500)
+        inset = (self.pattern_at[0] - self.backdrop_at[0],
+                 self.pattern_at[1] - self.backdrop_at[1])
+
+        def paint(_area, cr, _width, _height):
+            cr.set_source_rgb(1, 1, 1)
+            cr.paint()
+            cr.set_source_rgb(0.2, 0.2, 0.24)
+            scale = self.pattern_scale
+            origin = (inset[0] + PATTERN_SIZE[0] * (1 - scale) / 2,
+                      inset[1] + PATTERN_SIZE[1] * (1 - scale) / 2)
+            for x in PATTERN_COLS:
+                cr.rectangle(origin[0] + x * scale, 0, 2, self.backdrop_size[1])
+                cr.fill()
+            for y in PATTERN_ROWS:
+                cr.rectangle(0, origin[1] + y * scale, self.backdrop_size[0], 2)
+                cr.fill()
+
+        self.pattern_scale = 1.0
+        self.pattern_window = Gtk.Window(application=self, title="pauzak-test-pattern")
+        self.pattern_window.set_decorated(False)
+        area = Gtk.DrawingArea()
+        area.set_draw_func(paint)
+        self.pattern_area = area
+        self.pattern_window.set_child(area)
+        self.pattern_window.set_default_size(*self.backdrop_size)
+        self.pattern_window.present()
+        self.win.add_overlay(imagesrc.texture_from_file(Gio.File.new_for_path(PATTERN)))
+        self.aligned = self.win.overlays()[-1]
+        return self._then(self.align_place, 900)
+
+    def align_place(self):
+        x11.move(self.panel_xid, 10, 10)
+        x11.move(x11.surface_xid(self.pattern_window.get_surface()), *self.backdrop_at)
+        self.aligned.set_window_geometry(*self.pattern_at, *PATTERN_SIZE)
+        self.aligned.view.set_pan(9, -6)
+        return self._then(self.align_guard, 900)
+
+    def align_guard(self):
+        """With the panel over the overlay the scan would photograph the panel,
+        so it is refused rather than run."""
+        x11.move(self.panel_xid, self.pattern_at[0] + 20, self.pattern_at[1] + 20)
+        return self._then(self.align_guard_check, 800)
+
+    def align_guard_check(self):
+        self.win.activate_action("win.align", None)
+        check("aligning is refused while the panel covers the overlay",
+              not self.aligner.busy
+              and (self.aligned.view.pan_x, self.aligned.view.pan_y) == (9, -6),
+              f"busy={self.aligner.busy}, "
+              f"pan={(self.aligned.view.pan_x, self.aligned.view.pan_y)}")
+        x11.move(self.panel_xid, 10, 10)
+        return self._then(self.align_fire, 800)
+
+    def align_fire(self):
+        self.win.activate_action("win.align", None)
+        return self._then(self.align_check, 3000)
+
+    def align_check(self):
+        pan = (self.aligned.view.pan_x, self.aligned.view.pan_y)
+        check("aligning pans the image onto the edges underneath it",
+              abs(pan[0]) <= 1 and abs(pan[1]) <= 1, f"pan {pan}, started at (9, -6)")
+        check("the overlay is drawing itself again afterwards",
+              not self.aligned.view.scanning)
+        check("the matches it took are left on screen as guides",
+              any(guide.chosen for guide in self.aligned.view.guides),
+              f"{len(self.aligned.view.guides)} guides")
+        check("and the whole alignment is one step to undo", self.undo.can_undo())
+        self.undo.undo()
+        check("undoing it puts the image back out of line",
+              (self.aligned.view.pan_x, self.aligned.view.pan_y) == (9, -6),
+              f"{(self.aligned.view.pan_x, self.aligned.view.pan_y)}")
+        self.undo.redo()
+        return self._then(self.align_zoom, 600)
+
+    def align_zoom(self):
+        """The same match with the image scaled down, which is the case that
+        goes through the profile resampler on the way in."""
+        self.pattern_scale = 0.75
+        self.pattern_area.queue_draw()
+        self.aligned.set_zoom(0.75)
+        self.aligned.view.set_pan(-7, 11)
+        return self._then(self.align_zoom_fire, 1000)
+
+    def align_zoom_fire(self):
+        self.win.activate_action("win.align", None)
+        return self._then(self.align_zoom_check, 3000)
+
+    def align_zoom_check(self):
+        """Two pixels, not one: at a fractional zoom the image's own edges are
+        rendered soft while the ones on screen are crisp, and the profiles'
+        peaks sit a pixel or so apart because of it."""
+        pan = (self.aligned.view.pan_x, self.aligned.view.pan_y)
+        check("at 75% zoom it still lands within two pixels",
+              abs(pan[0]) <= 2 and abs(pan[1]) <= 2, f"pan {pan}, started at (-7, 11)")
+        self.aligned.set_zoom(1.0)
+        self.pattern_scale = 1.0
+        self.pattern_area.queue_draw()
+        self.row = self.win._row_for(self.aligned)
+        self.row.activate_action("row.visibility", None)
+        return self._then(self.menu_hidden_check, 800)
+
+    # -- the row's own menu ------------------------------------------------
+
+    def menu_hidden_check(self):
+        check("the row menu takes the overlay off the screen",
+              self.aligned.hidden and self.aligned._xid not in stacking_order())
+        self.row.activate_action("row.visibility", None)
+        return self._then(self.menu_shown_check, 900)
+
+    def menu_shown_check(self):
+        check("and puts it back", not self.aligned.hidden)
+        self.aligned.view.set_pan(13, -9)
+        return self._then(self.menu_align, 900)
+
+    def menu_align(self):
+        self.row.activate_action("row.align", None)
+        return self._then(self.menu_align_check, 3000)
+
+    def menu_align_check(self):
+        pan = (self.aligned.view.pan_x, self.aligned.view.pan_y)
+        check("Smart snap in the row menu lines the image up",
+              abs(pan[0]) <= 1 and abs(pan[1]) <= 1, f"pan {pan}, started at (13, -9)")
+        self.aligned.view.set_pan(-14, 8)
+        return self._then(self.key_align, 600)
+
+    def key_align(self):
+        """Ctrl+Shift+A with the overlay focused rather than the panel: the
+        overlay has no action map, so it cannot come through an accelerator."""
+        def work():
+            xdo("windowactivate", self.aligned._xid)
+            time.sleep(0.8)
+            xdo("key", "--clearmodifiers", "ctrl+shift+a")
+            time.sleep(3.0)
+            GLib.idle_add(self.key_align_check)
+
+        threading.Thread(target=work, daemon=True).start()
+        return False
+
+    def key_align_check(self):
+        pan = (self.aligned.view.pan_x, self.aligned.view.pan_y)
+        check("Ctrl+Shift+A reaches a focused overlay window",
+              abs(pan[0]) <= 1 and abs(pan[1]) <= 1, f"pan {pan}, started at (-14, 8)")
+        self.pattern_window.close()
+        self.aligned.close()
+        return self._then(self.finish, 600)
 
     def finish(self):
         failed = [r for r in results if not r[0]]
@@ -803,6 +1190,7 @@ class Suite(PauzakApplication):
 
 def main() -> int:
     make_image()
+    make_pattern()
     suite = Suite()
     suite.exit_code = 1
     suite.set_flags(suite.get_flags() | Gio.ApplicationFlags.NON_UNIQUE)

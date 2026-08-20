@@ -31,6 +31,15 @@ PY
     python3 -c 'import Xlib' 2>/dev/null || missing+=("python3-xlib")
     command -v xdg-open >/dev/null 2>&1 || true
 
+    # Aligning needs these two; everything else works without them, so they are
+    # reported rather than treated as a missing dependency.
+    local optional=()
+    python3 -c 'import numpy' 2>/dev/null || optional+=("python3-numpy")
+    command -v gnome-screenshot >/dev/null 2>&1 || optional+=("gnome-screenshot")
+    if [ ${#optional[@]} -gt 0 ]; then
+        echo "Align (Ctrl+Shift+A) needs: sudo apt install ${optional[*]}" >&2
+    fi
+
     if [ ${#missing[@]} -gt 0 ]; then
         echo "Missing dependencies. Install them with:" >&2
         echo "    sudo apt install ${missing[*]}" >&2

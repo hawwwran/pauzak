@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import itertools
 import math
 import os
+from typing import NamedTuple
 
 import gi
 
@@ -12,13 +14,32 @@ gi.require_version("Adw", "1")
 gi.require_version("Pango", "1.0")
 from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, GObject, Gtk, Pango  # noqa: E402
 
-from . import history, imagesrc, x11
-from .overlay import MAX_ZOOM, MIN_ZOOM, OverlayWindow
+from . import history, imagesrc, undo, x11
+from .overlay import MAX_ZOOM, MIN_SIZE, MIN_ZOOM, OverlayWindow, State
 
 # The zoom slider works in log2 so that 100% sits exactly on the middle mark
 # and each mark is a doubling.
 ZOOM_LOG_MIN = math.log2(MIN_ZOOM)
 ZOOM_LOG_MAX = math.log2(MAX_ZOOM)
+
+SPIN_LIMIT = 32000  # px bound on the geometry and offset spin buttons
+CLOSED_LIMIT = 8  # closed overlays whose pixels are kept for a possible undo
+
+
+class _Presence(NamedTuple):
+    """Whether an overlay is open, as a value undo can put back."""
+
+    key: int
+    open: bool
+
+
+class _Recipe(NamedTuple):
+    """What it takes to put a closed overlay back where it was."""
+
+    texture: Gdk.Texture
+    name: str
+    index: int
+    state: State
 
 
 class HistoryStrip(Gtk.ScrolledWindow):
@@ -97,9 +118,10 @@ class HistoryStrip(Gtk.ScrolledWindow):
 class OverlayRow(Gtk.ListBoxRow):
     __gtype_name__ = "PauzakOverlayRow"
 
-    def __init__(self, overlay: OverlayWindow, on_close):
+    def __init__(self, overlay: OverlayWindow, on_close, on_align):
         super().__init__()
         self.overlay = overlay
+        self._shown_hidden = None  # the state the row is currently drawn for
 
         box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         box.set_margin_top(6)
@@ -134,6 +156,8 @@ class OverlayRow(Gtk.ListBoxRow):
         label.set_ellipsize(Pango.EllipsizeMode.END)
         box.append(label)
 
+        box.append(self._menu_button(on_align))
+
         close = Gtk.Button(icon_name="window-close-symbolic", valign=Gtk.Align.CENTER)
         close.add_css_class("flat")
         close.set_tooltip_text("Close this overlay")
@@ -144,12 +168,47 @@ class OverlayRow(Gtk.ListBoxRow):
         overlay.connect("state-changed", lambda _o: self.refresh())
         self.refresh()
 
+    def _menu_button(self, on_align):
+        """The row's own menu: what applies to this overlay and nothing else."""
+        actions = Gio.SimpleActionGroup()
+        for name, run in (
+            ("visibility", lambda: self.overlay.set_hidden(not self.overlay.hidden)),
+            ("align", on_align),
+        ):
+            action = Gio.SimpleAction.new(name, None)
+            action.connect("activate", lambda *_args, run=run: run())
+            actions.add_action(action)
+        self.insert_action_group("row", actions)
+
+        self.menu = Gio.Menu()
+        # Horizontal ellipsis: view-more-symbolic is the vertical one.
+        self.more_button = Gtk.MenuButton(
+            icon_name="view-more-horizontal-symbolic", valign=Gtk.Align.CENTER
+        )
+        self.more_button.add_css_class("flat")
+        self.more_button.set_tooltip_text("More for this overlay")
+        self.more_button.set_menu_model(self.menu)
+        return self.more_button
+
+    def _rebuild_menu(self, hidden: bool) -> None:
+        self.menu.remove_all()
+        self.menu.append("Show" if hidden else "Hide", "row.visibility")
+        item = Gio.MenuItem.new("Smart snap", "row.align")
+        item.set_attribute_value("accel", GLib.Variant.new_string("<Control><Shift>a"))
+        self.menu.append_item(item)
+
     def _on_visibility_toggled(self, button):
         self.overlay.set_hidden(button.get_active())
         self.refresh()
 
     def refresh(self):
+        # Everything here follows from `hidden` alone, and state-changed
+        # arrives once per motion event while a drag is going on.
         hidden = self.overlay.hidden
+        if hidden == self._shown_hidden:
+            return
+        self._shown_hidden = hidden
+        self._rebuild_menu(hidden)
         if self.visibility_button.get_active() != hidden:
             self.visibility_button.set_active(hidden)
         self.eye.set_from_icon_name(
@@ -169,6 +228,13 @@ class ControlWindow(Adw.ApplicationWindow):
         self.set_default_size(460, 620)
         self._syncing = False
         self._above_holds = 0
+        self._sync_pending = False
+        self.undo = application.undo
+        # Overlays are addressed by key rather than by object: one that undo
+        # closes and opens again is a new window, and the key carries across.
+        self._keys = itertools.count(1)
+        self._by_key: dict[int, OverlayWindow] = {}
+        self._recipes: dict[int, _Recipe] = {}
 
         self._build_ui()
         self._install_actions()
@@ -176,6 +242,8 @@ class ControlWindow(Adw.ApplicationWindow):
         self._update_stack()
         self.history_strip.refresh()
         self.connect("notify::is-active", self._on_active_changed)
+        self.undo.connect("changed", self._on_undo_changed)
+        self._on_undo_changed()
 
     # -- construction ------------------------------------------------------
 
@@ -184,6 +252,13 @@ class ControlWindow(Adw.ApplicationWindow):
         open_button = Gtk.Button(label="Open…")
         open_button.set_action_name("win.open")
         header.pack_start(open_button)
+        for icon, tooltip, action in (
+            ("edit-undo-symbolic", "Undo (Ctrl+Z)", "win.undo"),
+            ("edit-redo-symbolic", "Redo (Ctrl+Shift+Z)", "win.redo"),
+        ):
+            button = Gtk.Button(icon_name=icon, tooltip_text=tooltip)
+            button.set_action_name(action)
+            header.pack_start(button)
         paste_button = Gtk.Button(icon_name="edit-paste-symbolic")
         paste_button.set_tooltip_text("Paste image from clipboard (Ctrl+V)")
         paste_button.set_action_name("win.paste")
@@ -239,6 +314,23 @@ class ControlWindow(Adw.ApplicationWindow):
         page = Adw.PreferencesPage(vexpand=True)
 
         window_group = Adw.PreferencesGroup(title="Overlay window")
+
+        position_row, self.position_spins = self._spin_row(
+            "Position",
+            None,
+            (("X", -SPIN_LIMIT, SPIN_LIMIT), ("Y", -SPIN_LIMIT, SPIN_LIMIT)),
+            self._on_geometry_spun,
+        )
+        window_group.add(position_row)
+
+        size_row, self.size_spins = self._spin_row(
+            "Size",
+            None,
+            (("W", MIN_SIZE, SPIN_LIMIT), ("H", MIN_SIZE, SPIN_LIMIT)),
+            self._on_geometry_spun,
+        )
+        window_group.add(size_row)
+
         self.touchable_row = Adw.SwitchRow(
             title="Touchable",
             subtitle="Off lets clicks pass straight through to what is underneath",
@@ -287,6 +379,14 @@ class ControlWindow(Adw.ApplicationWindow):
         self.zoom_row = zoom_row
         image_group.add(zoom_row)
 
+        offset_row, self.offset_spins = self._spin_row(
+            "Offset",
+            "0, 0 is centred",
+            (("X", -SPIN_LIMIT, SPIN_LIMIT), ("Y", -SPIN_LIMIT, SPIN_LIMIT)),
+            self._on_offset_spun,
+        )
+        image_group.add(offset_row)
+
         buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6, homogeneous=True)
         buttons.set_margin_top(6)
         buttons.set_margin_bottom(6)
@@ -294,6 +394,11 @@ class ControlWindow(Adw.ApplicationWindow):
             ("1:1", "Show the image at 100%, one image pixel per screen pixel", self._on_one_to_one),
             ("Fit", "Scale the image to fit the overlay window", self._on_fit),
             ("Center", "Undo panning and re-center the image", self._on_center),
+            (
+                "Align",
+                "Line the image's edges up with the ones underneath it (Ctrl+Shift+A)",
+                lambda _b: self.activate_action("win.align", None),
+            ),
         ):
             button = Gtk.Button(label=label, tooltip_text=tooltip)
             button.connect("clicked", handler)
@@ -328,16 +433,52 @@ class ControlWindow(Adw.ApplicationWindow):
         scale.value_label = value_label
         return scale, row
 
+    def _spin_row(self, title, subtitle, fields, handler):
+        """A row carrying one editable number per field, captioned X/Y or W/H.
+
+        The captions are what tell two bare spin buttons apart at a glance.
+        """
+        box = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL, spacing=4, valign=Gtk.Align.CENTER
+        )
+        spins = []
+        for caption, lower, upper in fields:
+            label = Gtk.Label(label=caption)
+            label.add_css_class("dim-label")
+            box.append(label)
+            spin = Gtk.SpinButton.new_with_range(lower, upper, 1)
+            spin.set_digits(0)
+            spin.set_width_chars(5)
+            spin.set_max_width_chars(5)
+            spin.add_css_class("numeric")
+            spin.connect("value-changed", handler)
+            box.append(spin)
+            spins.append(spin)
+        row = Adw.ActionRow(title=title)
+        if subtitle:
+            row.set_subtitle(subtitle)
+        row.add_suffix(box)
+        return row, spins
+
     def _install_actions(self):
         for name, handler in (
             ("open", self._action_open),
             ("paste", self._action_paste),
             ("close-overlay", lambda *_: self._close_overlay(self.selected_overlay())),
             ("toggle-hidden", lambda *_: self._toggle_hidden()),
+            ("align", self._action_align),
         ):
             action = Gio.SimpleAction.new(name, None)
             action.connect("activate", handler)
             self.add_action(action)
+        self.undo_action = self._add_stack_action("undo", self.undo.undo)
+        self.redo_action = self._add_stack_action("redo", self.undo.redo)
+
+    def _add_stack_action(self, name, run):
+        action = Gio.SimpleAction.new(name, None)
+        action.connect("activate", lambda *_: run())
+        self.add_action(action)
+        return action
 
     def _install_drop_target(self):
         target = Gtk.DropTarget.new(Gdk.FileList.__gtype__, Gdk.DragAction.COPY)
@@ -381,16 +522,38 @@ class ControlWindow(Adw.ApplicationWindow):
         return row.overlay if row else None
 
     def add_overlay(self, loaded: imagesrc.Loaded) -> None:
-        overlay = OverlayWindow(self.get_application(), loaded.texture, loaded.name)
+        key = next(self._keys)
+        self._install(loaded.texture, loaded.name, key)
+        self.undo.push(
+            undo.Step(
+                apply=self._apply_presence,
+                before=_Presence(key, False),
+                after=_Presence(key, True),
+                key=key,
+            )
+        )
+        history.remember(loaded.path)
+        self.history_strip.refresh()
+
+    def _install(self, texture, name, key, index=None, state=None) -> OverlayWindow:
+        overlay = OverlayWindow(self.get_application(), texture, name, key, state)
+        overlay.recorder = self._record_state
         overlay.connect("state-changed", self._on_overlay_state_changed)
         overlay.connect("close-request", self._on_overlay_close_request)
-        row = OverlayRow(overlay, self._close_overlay)
-        self.list_box.append(row)
+        self._by_key[key] = overlay
+        row = OverlayRow(
+            overlay,
+            self._close_overlay,
+            lambda: self.get_application().aligner.align(overlay),
+        )
+        if index is None:
+            self.list_box.append(row)
+        else:
+            self.list_box.insert(row, index)
         self.list_box.select_row(row)
         overlay.present()
         self._update_stack()
-        history.remember(loaded.path)
-        self.history_strip.refresh()
+        return overlay
 
     def _open_from_history(self, path: str) -> None:
         try:
@@ -412,10 +575,30 @@ class ControlWindow(Adw.ApplicationWindow):
 
     def _on_overlay_close_request(self, overlay):
         row = self._row_for(overlay)
+        self._remember_closed(overlay, row.get_index() if row is not None else 0)
         if row is not None:
             self.list_box.remove(row)
+        self._by_key.pop(overlay.key, None)
+        # A no-op while undo is the one doing the closing, which is what keeps
+        # an undone open from coming back as a step of its own.
+        self.undo.push(
+            undo.Step(
+                apply=self._apply_presence,
+                before=_Presence(overlay.key, True),
+                after=_Presence(overlay.key, False),
+                key=overlay.key,
+            )
+        )
         GLib.idle_add(self._after_overlay_removed)
         return False
+
+    def _remember_closed(self, overlay, index):
+        # Popped before it is set so the dict stays in closing order, which is
+        # the order _prune_recipes lets them go in.
+        self._recipes.pop(overlay.key, None)
+        self._recipes[overlay.key] = _Recipe(
+            overlay.view.texture, overlay.image_name, index, overlay.snapshot()
+        )
 
     def _after_overlay_removed(self):
         rows = list(self.list_box)
@@ -428,6 +611,76 @@ class ControlWindow(Adw.ApplicationWindow):
         has_any = self.list_box.get_row_at_index(0) is not None
         self.stack.set_visible_child_name("ready" if has_any else "empty")
         self._sync_controls()
+
+    # -- undo / redo -------------------------------------------------------
+
+    def _record_state(self, overlay, before, after, tag):
+        """An overlay reporting that something about it changed."""
+        self.undo.push(
+            undo.Step(
+                apply=self._apply_state,
+                before=(overlay.key, before),
+                after=(overlay.key, after),
+                key=overlay.key,
+                tag=tag,
+            )
+        )
+
+    def _apply_state(self, payload):
+        """The overlay is always there to be restored.
+
+        Steps are dropped oldest first, and an overlay's close is newer than
+        every state step of its own, so walking back always meets the close --
+        which reopens it -- before any of them; forget() drops a key's steps as
+        a set. The guard is for a corrupt stack, not for a reachable case.
+        """
+        key, state = payload
+        overlay = self._by_key.get(key)
+        if overlay is None:
+            return
+        overlay.restore(state)
+        # Undo that changes an overlay you are not looking at would otherwise
+        # go unnoticed, so the panel follows it.
+        self._select(overlay)
+
+    def _apply_presence(self, payload):
+        overlay = self._by_key.get(payload.key)
+        if payload.open and overlay is None:
+            self._reopen(payload.key)
+        elif not payload.open and overlay is not None:
+            overlay.close()
+
+    def _reopen(self, key):
+        recipe = self._recipes.get(key)
+        if recipe is not None:
+            self._install(recipe.texture, recipe.name, key, recipe.index, recipe.state)
+
+    def _select(self, overlay):
+        row = self._row_for(overlay)
+        if row is not None and row is not self.list_box.get_selected_row():
+            self.list_box.select_row(row)
+
+    def _on_undo_changed(self, *_args):
+        self.undo_action.set_enabled(self.undo.can_undo())
+        self.redo_action.set_enabled(self.undo.can_redo())
+        self._prune_recipes()
+
+    def _prune_recipes(self):
+        """Let go of a closed overlay's pixels once undo can no longer reach it.
+
+        An image kept for a possible reopen is an image kept in memory, so the
+        history is bounded by that as well as by its step count: past
+        CLOSED_LIMIT closed overlays the oldest go, and their steps go with them
+        rather than staying on as steps that would silently do nothing.
+        """
+        live = self.undo.keys() | set(self._by_key)
+        self._recipes = {key: r for key, r in self._recipes.items() if key in live}
+        closed = [key for key in self._recipes if key not in self._by_key]
+        excess = closed[: max(0, len(closed) - CLOSED_LIMIT)]
+        if excess:
+            for key in excess:
+                del self._recipes[key]
+            self.undo.forget(set(excess))
 
     # -- control <-> overlay synchronisation -------------------------------
 
@@ -443,8 +696,21 @@ class ControlWindow(Adw.ApplicationWindow):
         self.border_button.set_rgba(overlay.view.border_color)
         self.border_color_row.set_sensitive(overlay.view.border_visible)
         self.zoom_scale.set_value(math.log2(overlay.view.zoom))
+        self._sync_numbers(overlay)
         self._syncing = False
         self._update_value_labels(overlay)
+
+    def _sync_numbers(self, overlay):
+        x, y, width, height = overlay.geometry()
+        for spin, value in (
+            (self.position_spins[0], x),
+            (self.position_spins[1], y),
+            (self.size_spins[0], width),
+            (self.size_spins[1], height),
+            (self.offset_spins[0], overlay.view.pan_x),
+            (self.offset_spins[1], overlay.view.pan_y),
+        ):
+            spin.set_value(value)
 
     def _update_value_labels(self, overlay):
         self.opacity_scale.value_label.set_text(f"{overlay.view.image_opacity * 100:.0f}%")
@@ -456,8 +722,18 @@ class ControlWindow(Adw.ApplicationWindow):
         )
 
     def _on_overlay_state_changed(self, overlay):
-        if overlay is self.selected_overlay():
-            self._sync_controls()
+        """Coalesce: a drag reports every motion event, and restoring a state
+        reports once per property, while the panel only has to end up right
+        once per turn of the loop."""
+        if overlay is not self.selected_overlay() or self._sync_pending:
+            return
+        self._sync_pending = True
+        GLib.idle_add(self._sync_now)
+
+    def _sync_now(self):
+        self._sync_pending = False
+        self._sync_controls()
+        return GLib.SOURCE_REMOVE
 
     def _on_touchable_toggled(self, row, _param):
         overlay = self.selected_overlay()
@@ -483,17 +759,33 @@ class ControlWindow(Adw.ApplicationWindow):
     def _on_opacity_changed(self, scale):
         overlay = self.selected_overlay()
         if overlay and not self._syncing:
-            overlay.view.image_opacity = scale.get_value() / 100
-            overlay.view.queue_draw()
+            overlay.set_image_opacity(scale.get_value() / 100)
         if overlay:
             self._update_value_labels(overlay)
 
     def _on_zoom_changed(self, scale):
         overlay = self.selected_overlay()
         if overlay and not self._syncing:
-            overlay.view.set_zoom(2 ** scale.get_value())
+            overlay.set_zoom(2 ** scale.get_value())
         if overlay:
             self._update_value_labels(overlay)
+
+    def _on_geometry_spun(self, _spin):
+        overlay = self.selected_overlay()
+        if overlay and not self._syncing:
+            overlay.set_window_geometry(
+                self.position_spins[0].get_value(),
+                self.position_spins[1].get_value(),
+                self.size_spins[0].get_value(),
+                self.size_spins[1].get_value(),
+            )
+
+    def _on_offset_spun(self, _spin):
+        overlay = self.selected_overlay()
+        if overlay and not self._syncing:
+            overlay.set_image_pan(
+                self.offset_spins[0].get_value(), self.offset_spins[1].get_value()
+            )
 
     def _on_one_to_one(self, _button):
         overlay = self.selected_overlay()
@@ -509,6 +801,19 @@ class ControlWindow(Adw.ApplicationWindow):
         overlay = self.selected_overlay()
         if overlay:
             overlay.center_image()
+
+    # -- lining up with what is underneath ---------------------------------
+
+    def _action_align(self, *_args):
+        self.get_application().aligner.align(self.selected_overlay())
+
+    def panel_rect(self):
+        """Where the panel is, so a scan can refuse to photograph it."""
+        surface = self.get_surface()
+        if surface is None:
+            return (0, 0, 0, 0)
+        x, y = x11.position(x11.surface_xid(surface))
+        return (x, y, self.get_width(), self.get_height())
 
     # -- image intake ------------------------------------------------------
 

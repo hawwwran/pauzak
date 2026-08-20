@@ -8,7 +8,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, GLib, Gio, Gtk  # noqa: E402
 
-from . import APP_ID, imagesrc
+from . import APP_ID, align, imagesrc, undo
 from .control import ControlWindow
 
 # Overlay windows must be transparent wherever the image is not, otherwise the
@@ -47,6 +47,12 @@ class PauzakApplication(Adw.Application):
     def __init__(self):
         super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.HANDLES_OPEN)
         self.control = None
+        # One stack for every overlay: undo walks back through what was changed
+        # in the order it was changed, whichever overlay each step belongs to.
+        self.undo = undo.UndoStack()
+        # Same reason as the stack: an overlay asks for an alignment without
+        # having to know that the panel is the thing that runs one.
+        self.aligner = align.Aligner()
 
     def do_startup(self):
         Adw.Application.do_startup(self)
@@ -62,6 +68,9 @@ class PauzakApplication(Adw.Application):
         self.set_accels_for_action("win.open", ["<Control>o"])
         self.set_accels_for_action("win.close-overlay", ["<Control>w"])
         self.set_accels_for_action("win.toggle-hidden", ["<Control>h"])
+        self.set_accels_for_action("win.undo", ["<Control>z"])
+        self.set_accels_for_action("win.redo", ["<Control><Shift>z", "<Control>y"])
+        self.set_accels_for_action("win.align", ["<Control><Shift>a"])
 
     def do_activate(self):
         self._control_window().present()
@@ -79,6 +88,7 @@ class PauzakApplication(Adw.Application):
         if self.control is None:
             self.control = ControlWindow(self)
             self.control.connect("close-request", self._on_control_closed)
+            self.aligner.host = self.control
         return self.control
 
     def _on_control_closed(self, window):
