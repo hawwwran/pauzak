@@ -35,10 +35,10 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Gdk, GLib, Gio, Gtk  # noqa: E402
+from gi.repository import Gdk, GdkPixbuf, GLib, Gio, Gtk  # noqa: E402
 from PIL import Image, ImageDraw  # noqa: E402
 
-from pauzak import history, imagesrc, snap, x11  # noqa: E402
+from pauzak import diff, history, imagesrc, scan, snap, x11  # noqa: E402
 from pauzak.app import PauzakApplication  # noqa: E402
 from pauzak.overlay import SNAP_DISTANCE, screen_bounds  # noqa: E402
 
@@ -1025,6 +1025,119 @@ class Suite(PauzakApplication):
         check("a blank backdrop moves nothing and offers no guides",
               (nothing.dx, nothing.dy, len(nothing.guides)) == (0.0, 0.0, 0),
               f"{(nothing.dx, nothing.dy)}, {len(nothing.guides)} guides")
+        return self._then(self.diff_math)
+
+    def diff_math(self):
+        """What counts as a difference, on arrays rather than on the screen."""
+        import numpy as np
+
+        def page(cols, rows, ink=40, bg=250):
+            image = np.full((120, 200, 3), float(bg), dtype=np.float32)
+            for x in cols:
+                image[:, x : x + 2] = ink
+            for y in rows:
+                image[y : y + 2, :] = ink
+            return image
+
+        design = page((30, 100, 160), (20, 80))
+        same = diff.compare(design, page((30, 100, 160), (20, 80)))
+        check("two pictures that agree are not marked at all", same.coverage == 0.0,
+              f"{same.coverage:.4f}")
+
+        moved = diff.compare(design, page((30, 106, 160), (20, 80)))
+        check("an edge in the wrong place is marked", moved.coverage > 0.005,
+              f"{moved.coverage * 100:.2f}%")
+        marked = np.where(moved.rgba[:, :, 3].sum(axis=0) > 0)[0]
+        # Guarded: check() records a failure and carries on, so reducing an
+        # empty array here would take every later stage down with it.
+        check("and the marks cover where it is and where it should be",
+              marked.size > 0 and marked.min() <= 101 and marked.max() >= 105,
+              f"columns {list(marked[:1]) + list(marked[-1:])}")
+
+        # Both sides of a moved edge, so which way it is out can be read off.
+        one_sided = diff.compare(design, page((106,), (20, 80)))
+        magenta = (one_sided.rgba[:, :, 0] > one_sided.rgba[:, :, 2]) & (
+            one_sided.rgba[:, :, 3] > 0
+        )
+        yellow = (one_sided.rgba[:, :, 1] > 150) & (one_sided.rgba[:, :, 2] < 60) & (
+            one_sided.rgba[:, :, 3] > 0
+        )
+        check("the image having the ink and the screen having it read differently",
+              magenta.any() and yellow.any(), f"magenta={magenta.sum()} yellow={yellow.sum()}")
+
+        # An edge in the same place, merely softened: this is what the page's
+        # own text does to every glyph, and it must not be marked.
+        softened = page((30, 100, 160), (20, 80))
+        for column in (29, 32, 99, 102, 159, 162):
+            softened[:, column] = 150
+        soft = diff.compare(design, softened)
+        check("an edge softened in place is not a difference",
+              soft.coverage == 0.0, f"{soft.coverage * 100:.2f}%")
+
+        missing = diff.compare(design, page((30, 160), (20, 80)))
+        check("a stroke the screen is missing is marked, thin as it is",
+              missing.coverage > 0.002, f"{missing.coverage * 100:.2f}%")
+
+        # The pale boxes interfaces are made of, at the levels a real one has:
+        # 244 of fill and 233 of border against 255 of white. A single
+        # threshold either cannot see these move at all or repaints the screen
+        # when its white is a shade off, which is why there are two.
+        def boxed(left, fill=244, border=233, bg=255):
+            image = np.full((120, 200, 3), float(bg), dtype=np.float32)
+            image[30:90, left : left + 90] = fill
+            image[30:32, left : left + 90] = border
+            image[88:90, left : left + 90] = border
+            image[30:90, left : left + 2] = border
+            image[30:90, left + 88 : left + 90] = border
+            return image
+
+        pale = boxed(40)
+        for shift in (1, 2, 4):
+            moved = diff.compare(pale, boxed(40 + shift))
+            check(f"a pale box {shift} px out of place is marked",
+                  moved.coverage > 0.001, f"{moved.coverage * 100:.2f}% at {shift} px")
+        tinted = diff.compare(pale, boxed(40, fill=236, border=225, bg=247))
+        check("but a page whose every shade is off by eight is not",
+              tinted.coverage == 0.0, f"{tinted.coverage * 100:.2f}%")
+        wrong_fill = diff.compare(pale, boxed(40, fill=200))
+        check("while a box that is simply the wrong shade still is",
+              wrong_fill.coverage > 0.001, f"{wrong_fill.coverage * 100:.2f}%")
+
+        # A design exported with a transparent background is the ordinary case.
+        # Where it is see-through what you see is the page, so it agrees there;
+        # comparing the colour stored behind the transparency -- black, here --
+        # would report the whole overlay as one enormous difference.
+        drawn = np.zeros((100, 200, 4), dtype=np.uint8)
+        drawn[40:60, 50:150] = (30, 30, 40, 255)
+        see_through = GdkPixbuf.Pixbuf.new_from_bytes(
+            GLib.Bytes.new(drawn.tobytes()), GdkPixbuf.Colorspace.RGB, True, 8,
+            200, 100, 200 * 4,
+        )
+        white = np.full((100, 200, 3), 255.0, dtype=np.float32)
+        composited = diff.compare(diff.over(see_through, white), white)
+        check("only the drawn part of a transparent image is compared",
+              0.05 < composited.coverage < 0.15, f"{composited.coverage * 100:.2f}%")
+
+        # Only the piece of the image the window shows is ever compared, and
+        # only that piece is scaled: a 3 MP image at sixteen times its size is
+        # gigabytes of pixbuf to read a few hundred thousand of them.
+        def flat_pixbuf(width, height, color):
+            pixels = np.zeros((height, width, 4), dtype=np.uint8)
+            pixels[:, :] = color
+            return GdkPixbuf.Pixbuf.new_from_bytes(
+                GLib.Bytes.new(pixels.tobytes()), GdkPixbuf.Colorspace.RGB, True, 8,
+                width, height, width * 4,
+            )
+
+        zoomed = scan._difference(
+            flat_pixbuf(2000, 1500, (200, 60, 60, 255)),
+            (-12000.0, -9000.0, 32000.0, 24000.0),
+            (800, 600),
+            flat_pixbuf(800, 600, (255, 255, 255, 255)),
+        )
+        check("a hugely zoomed image is compared over the window, not in full",
+              zoomed is not None and zoomed[1] == (0, 0, 800, 600),
+              f"{zoomed[1] if zoomed else None}")
         return self._then(self.align_setup)
 
     def align_setup(self):
@@ -1045,11 +1158,18 @@ class Suite(PauzakApplication):
             for x in PATTERN_COLS:
                 cr.rectangle(origin[0] + x * scale, 0, 2, self.backdrop_size[1])
                 cr.fill()
+            if self.pattern_extra:
+                # A bar the design does not have: the page having drawn
+                # something of its own is exactly what a diff is for.
+                cr.rectangle(origin[0] + (PATTERN_COLS[0] + 60) * scale, 0, 6,
+                             self.backdrop_size[1])
+                cr.fill()
             for y in PATTERN_ROWS:
                 cr.rectangle(0, origin[1] + y * scale, self.backdrop_size[0], 2)
                 cr.fill()
 
         self.pattern_scale = 1.0
+        self.pattern_extra = False
         self.pattern_window = Gtk.Window(application=self, title="pauzak-test-pattern")
         self.pattern_window.set_decorated(False)
         area = Gtk.DrawingArea()
@@ -1078,9 +1198,9 @@ class Suite(PauzakApplication):
     def align_guard_check(self):
         self.win.activate_action("win.align", None)
         check("aligning is refused while the panel covers the overlay",
-              not self.aligner.busy
+              not self.scanner.busy
               and (self.aligned.view.pan_x, self.aligned.view.pan_y) == (9, -6),
-              f"busy={self.aligner.busy}, "
+              f"busy={self.scanner.busy}, "
               f"pan={(self.aligned.view.pan_x, self.aligned.view.pan_y)}")
         x11.move(self.panel_xid, 10, 10)
         return self._then(self.align_fire, 800)
@@ -1174,6 +1294,77 @@ class Suite(PauzakApplication):
         pan = (self.aligned.view.pan_x, self.aligned.view.pan_y)
         check("Ctrl+Shift+A reaches a focused overlay window",
               abs(pan[0]) <= 1 and abs(pan[1]) <= 1, f"pan {pan}, started at (-14, 8)")
+        return self._then(self.diff_setup, 400)
+
+    # -- the visual diff ---------------------------------------------------
+
+    def diff_setup(self):
+        check("nothing is being compared to begin with", not self.aligned.showing_diff())
+        self.undo_depth = len(self.undo._done)
+        self.pattern_extra = True
+        self.pattern_area.queue_draw()
+        return self._then(self.diff_fire, 1000)
+
+    def diff_fire(self):
+        self.win.activate_action("win.diff", None)
+        return self._then(self.diff_check, 3500)
+
+    def diff_check(self):
+        check("Ctrl+Shift+D marks where the screen and the image disagree",
+              self.aligned.showing_diff())
+        marks = self.aligned.view.diff
+        if marks is not None:
+            check("the marks are laid over where the image is drawn",
+                  marks[1][2] > 100 and marks[1][3] > 100, marks[1])
+        check("the overlay is drawing itself again afterwards",
+              not self.aligned.view.scanning)
+        # The marks belong to one arrangement of the image, and saying so after
+        # it has moved would be a lie.
+        self.aligned.view.set_pan(20, 0)
+        check("moving the image drops the marks", not self.aligned.showing_diff())
+        self.aligned.view.set_pan(0, 0)
+        return self._then(self.diff_again, 700)
+
+    def diff_again(self):
+        self.win.activate_action("win.diff", None)
+        return self._then(self.diff_toggle_check, 3500)
+
+    def diff_toggle_check(self):
+        check("asking again puts them back", self.aligned.showing_diff())
+        check("comparing adds nothing to the history",
+              len(self.undo._done) == self.undo_depth,
+              f"{len(self.undo._done)} steps, was {self.undo_depth}")
+        return self._then(self.diff_badge, 300)
+
+    def diff_badge(self):
+        """The badge on the thumbnail, and the point of it: the marks are put
+        away and brought back without the screen being read again, which takes
+        about a second."""
+        row = self.win._row_for(self.aligned)
+        self.diff_row = row
+        self.diff_texture = self.aligned.view.diff[0]
+        check("the badge shows the comparison is on", row.diff_button.get_active())
+        row.diff_button.set_active(False)
+        check("turning the badge off takes the marks off the screen",
+              not self.aligned.showing_diff())
+        check("but keeps them, ready to come back", self.aligned.has_diff())
+        row.diff_button.set_active(True)
+        check("turning it back on shows them again", self.aligned.showing_diff())
+        check("and they are the very same marks, not a second reading",
+              self.aligned.view.diff[0] is self.diff_texture)
+        return self._then(self.diff_fresh, 300)
+
+    def diff_fresh(self):
+        """Visual diff in the menu asks for the screen to be read again."""
+        self.win._row_for(self.aligned).activate_action("row.diff", None)
+        return self._then(self.diff_fresh_check, 3500)
+
+    def diff_fresh_check(self):
+        check("the menu takes a fresh reading", self.aligned.showing_diff())
+        check("which is a new set of marks",
+              self.aligned.view.diff[0] is not self.diff_texture)
+        self.aligned.view.set_pan(30, 0)
+        check("and moving the image still drops them", not self.aligned.has_diff())
         self.pattern_window.close()
         self.aligned.close()
         return self._then(self.finish, 600)

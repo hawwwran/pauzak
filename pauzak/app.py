@@ -8,8 +8,10 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, GLib, Gio, Gtk  # noqa: E402
 
-from . import APP_ID, align, imagesrc, undo
+from . import APP_ID, diff, imagesrc, scan, undo
 from .control import ControlWindow
+
+_MARK_COLOR = "#%02x%02x%02x" % diff.IMAGE_DARKER
 
 # Overlay windows must be transparent wherever the image is not, otherwise the
 # default window background shows up as a grey slab around a scaled-down image.
@@ -22,9 +24,10 @@ window.pauzak-overlay > * {
     border: none;
 }
 
-/* The eye badge sits on top of an arbitrary image, so it carries its own
+/* The badges sit on top of an arbitrary image, so they carry their own
    contrast rather than relying on the theme's foreground colour. */
-.pauzak-eye {
+.pauzak-eye,
+.pauzak-diff-badge {
     background-color: rgba(0, 0, 0, 0.7);
     color: #ffffff;
     border-radius: 5px;
@@ -33,12 +36,21 @@ window.pauzak-overlay > * {
     -gtk-icon-size: 12px;
 }
 
+.pauzak-diff-badge {
+    min-width: 0;
+    min-height: 0;
+}
+
 .pauzak-thumb-button {
     padding: 2px;
     min-width: 0;
     min-height: 0;
 }
 """
+
+# Lit, the comparison badge wears the colour of the marks it puts on screen, so
+# retuning that magenta in diff.py does not leave the badge behind on the old one.
+_CSS += ".pauzak-diff-badge:checked { background-color: %s; }\n" % _MARK_COLOR
 
 
 class PauzakApplication(Adw.Application):
@@ -50,9 +62,9 @@ class PauzakApplication(Adw.Application):
         # One stack for every overlay: undo walks back through what was changed
         # in the order it was changed, whichever overlay each step belongs to.
         self.undo = undo.UndoStack()
-        # Same reason as the stack: an overlay asks for an alignment without
-        # having to know that the panel is the thing that runs one.
-        self.aligner = align.Aligner()
+        # Same reason as the stack: an overlay asks for a scan of what is under
+        # it without having to know that the panel is the thing that runs one.
+        self.scanner = scan.Scanner()
 
     def do_startup(self):
         Adw.Application.do_startup(self)
@@ -71,6 +83,7 @@ class PauzakApplication(Adw.Application):
         self.set_accels_for_action("win.undo", ["<Control>z"])
         self.set_accels_for_action("win.redo", ["<Control><Shift>z", "<Control>y"])
         self.set_accels_for_action("win.align", ["<Control><Shift>a"])
+        self.set_accels_for_action("win.diff", ["<Control><Shift>d"])
 
     def do_activate(self):
         self._control_window().present()
@@ -88,7 +101,7 @@ class PauzakApplication(Adw.Application):
         if self.control is None:
             self.control = ControlWindow(self)
             self.control.connect("close-request", self._on_control_closed)
-            self.aligner.host = self.control
+            self.scanner.host = self.control
         return self.control
 
     def _on_control_closed(self, window):

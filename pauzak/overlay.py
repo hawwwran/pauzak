@@ -160,6 +160,9 @@ class ImageView(Gtk.Widget):
         # Guides are snap.Guide values; the view only reads their fields.
         self.guides = ()
         self.scanning = False
+        self.diff = None  # (texture, rect, arrangement) once one has been made
+        self.diff_visible = True
+        self.position_source = None  # set by the window; see arrangement()
         self.set_hexpand(True)
         self.set_vexpand(True)
 
@@ -177,9 +180,20 @@ class ImageView(Gtk.Widget):
             )
             return
         snapshot.push_clip(Graphene.Rect().init(0, 0, width, height))
-        snapshot.push_opacity(self.image_opacity)
-        snapshot.append_scaled_texture(self.texture, self._filter(), self._image_rect())
-        snapshot.pop()
+        marks = self._valid_diff() if self.diff_visible else None
+        if marks is not None:
+            # The image itself is not drawn under a comparison: what the marks
+            # are about is the screen, and it has to stay visible. Nor is the
+            # opacity slider applied to them -- they are a reading, like the
+            # border and the guides, not tracing paper.
+            texture, rect, _key = marks
+            snapshot.append_texture(texture, Graphene.Rect().init(*rect))
+        else:
+            snapshot.push_opacity(self.image_opacity)
+            snapshot.append_scaled_texture(
+                self.texture, self._filter(), self._image_rect()
+            )
+            snapshot.pop()
         snapshot.pop()
         if self.border_visible:
             self._snapshot_border(snapshot, width, height)
@@ -198,6 +212,41 @@ class ImageView(Gtk.Widget):
         outline = Gsk.RoundedRect()
         outline.init_from_rect(Graphene.Rect().init(0, 0, width, height), 0)
         snapshot.append_border(outline, [BORDER_WIDTH] * 4, [self.border_color] * 4)
+
+    def set_diff(self, texture, rect, arrangement) -> None:
+        """`arrangement` is what the marks were measured against, which is not
+        necessarily what is on screen by the time they arrive."""
+        self.diff = (texture, rect, arrangement)
+        self.diff_visible = True
+        self.queue_draw()
+
+    def _valid_diff(self):
+        """The marks, if the image has not moved since they were worked out.
+
+        Keeping them after a pan, a zoom or a resize would be a measurement of
+        one arrangement shown over another, so they are dropped the moment the
+        arrangement they belong to is gone -- whether they were on show at the
+        time or merely put away.
+        """
+        if self.diff is not None and self.diff[2] != self.arrangement():
+            self.diff = None
+        return self.diff
+
+    def arrangement(self):
+        """Everything that decides what the window is showing and where.
+
+        The window's own place on screen belongs in here: the marks describe
+        what was underneath it, and dragging the window puts something else
+        there just as surely as panning the image does.
+        """
+        return (
+            self.zoom,
+            self.pan_x,
+            self.pan_y,
+            self.get_width(),
+            self.get_height(),
+            self.window_position(),
+        )
 
     def _snapshot_guides(self, snapshot, width: int, height: int) -> None:
         """Solid where a match was taken, dashed pairs where one was possible."""
@@ -231,6 +280,10 @@ class ImageView(Gtk.Widget):
     def _image_rect(self) -> Graphene.Rect:
         x, y, w, h = self.image_geometry()
         return Graphene.Rect().init(x, y, w, h)
+
+    def window_position(self):
+        """Overridden from outside: a view does not know where its window is."""
+        return self.position_source() if self.position_source is not None else (0, 0)
 
     def image_geometry(self) -> tuple[float, float, float, float]:
         scaled_w = self.texture.get_width() * self.zoom
@@ -323,6 +376,7 @@ class OverlayWindow(Gtk.Window):
         self.set_decorated(False)
         self.add_css_class("pauzak-overlay")
         self.view = ImageView(texture)
+        self.view.position_source = self.window_position
         self.set_child(self.view)
         size = (state.width, state.height) if state else self._initial_size(texture)
         self.set_default_size(*size)
@@ -488,6 +542,37 @@ class OverlayWindow(Gtk.Window):
             )
         self.show_guides(alignment.guides)
         self.emit("state-changed")
+
+    def show_diff(self, texture, rect, arrangement) -> None:
+        self.view.set_diff(texture, rect, arrangement)
+        self.emit("state-changed")
+
+    def clear_diff(self) -> None:
+        if self.view.diff is None:
+            return
+        self.view.diff = None
+        self.view.queue_draw()
+        self.emit("state-changed")
+
+    def toggle_diff(self) -> bool:
+        """Put the marks away, or bring the same ones back. False if there are
+        none to show, in which case something has to go and read the screen."""
+        if not self.has_diff():
+            return False
+        self.view.diff_visible = not self.view.diff_visible
+        self.view.queue_draw()
+        self.emit("state-changed")
+        return True
+
+    def has_diff(self) -> bool:
+        """Whether a comparison has been made and still fits the image."""
+        return self.view._valid_diff() is not None
+
+    def arrangement(self):
+        return self.view.arrangement()
+
+    def showing_diff(self) -> bool:
+        return self.has_diff() and self.view.diff_visible
 
     def show_guides(self, guides) -> None:
         self.view.guides = tuple(guides)
@@ -835,7 +920,8 @@ class OverlayWindow(Gtk.Window):
         for name, run in (
             ("undo", lambda: self.get_application().undo.undo()),
             ("redo", lambda: self.get_application().undo.redo()),
-            ("align", lambda: self.get_application().aligner.align(self)),
+            ("align", lambda: self.get_application().scanner.align(self)),
+            ("diff", lambda: self.get_application().scanner.diff(self)),
             ("close-overlay", self.close),
         ):
             action = Gio.SimpleAction.new(name, None)

@@ -61,9 +61,9 @@ Safe to run twice, or when nothing was installed. The checkout is the only
 thing left afterwards; delete it to finish.
 
 Needs `python3-gi`, `gir1.2-gtk-4.0`, `gir1.2-adw-1` and `python3-xlib`, all
-present on a stock Zorin 18 install. Align also wants `python3-numpy` and
-`gnome-screenshot`; without them everything else still works and aligning says
-what is missing.
+present on a stock Zorin 18 install. Smart snap and the visual diff also want
+`python3-numpy` and `gnome-screenshot`; without them everything else still
+works and both say what is missing.
 
 ## Using it
 
@@ -78,8 +78,10 @@ Getting an image in, from the control panel:
 | `Ctrl+W` | closes the selected overlay |
 | `Ctrl+Z` / `Ctrl+Shift+Z` | steps back and forward through everything you have changed (`Ctrl+Y` redoes too) |
 | `Ctrl+Shift+A` | lines the image up with whatever is under the overlay |
+| `Ctrl+Shift+D` | shows the differences with what is under the overlay, or puts them away again |
 | click a thumbnail in the list | hides or shows that overlay |
-| the ⋯ button on a row | that overlay's own menu: Hide/Show and Smart snap |
+| the badge at the corner of a thumbnail | shows or puts away that overlay's differences |
+| the ⋯ button on a row | that overlay's own menu: Hide/Show, Smart snap, Visual diff |
 | click a thumbnail in the bottom strip | opens a recently used image again |
 
 On the overlay itself:
@@ -95,6 +97,7 @@ On the overlay itself:
 | wheel | zooms around the pointer (`Shift` for finer steps) |
 | `Ctrl+Z` / `Ctrl+Shift+Z` | the same history as the panel's, without going back to the panel |
 | `Ctrl+Shift+A` | lines this overlay up with what is under it |
+| `Ctrl+Shift+D` | shows or puts away this overlay's differences with what is under it |
 | `Ctrl+W` | closes this overlay |
 | `Esc` | closes the overlay |
 
@@ -220,6 +223,56 @@ alignment you ask for and hopeless per frame. Snapping continuously wants the
 ScreenCast portal and a PipeWire stream, and with it a consent dialog and the
 screen-sharing indicator.
 
+**Visual diff** (`Ctrl+Shift+D`, or the badge at the corner of the thumbnail)
+compares the image against what is under it and paints only the places they
+disagree, so an imperfection is something you see rather than something you hunt
+for. The image itself is not drawn while the marks are up: what they are about
+is the page, and the page has to stay visible under them.
+
+The same key and the same badge put the marks away and bring them back, and
+bringing them back does not read the screen again -- reading it takes about a
+second, and glancing from the marks to the page and back is the whole point.
+Visual diff in the ⋯ menu is the one that always takes a fresh reading, for when
+the page has moved on. Either way the marks are dropped the moment the image is
+panned or zoomed, or the window moved or resized -- they describe what was under
+one arrangement, and over another they would be a lie.
+
+Marks come in two colours, because knowing an edge is out is half the answer
+and knowing which way is the other half. **Magenta** is where the image is the
+darker of the two, so usually where the design has ink the page has not caught
+up with; **yellow** is where the screen is darker, usually something the page
+has too much of. A moved edge shows as both, one on each side of it. How solid
+a mark is follows how far apart the two are, so a faint disagreement reads as
+faint. The toast gives the share of pixels that differ.
+
+The comparison is perceptual, not arithmetic. A plain subtraction lights up
+every difference in font rendering, every subpixel fringe and every shade of
+anti-aliasing, which buries what matters; this uses the weighted YIQ distance
+and the anti-aliasing test from `pixelmatch`, the measure the visual-regression
+tools settled on. A pixel is forgiven only when it is a transition between two
+flat regions that *both* pictures have, which is what an edge rendered a little
+differently in the same place looks like. A stroke the page is missing is not
+that, however thin.
+
+Each difference is measured twice, and that is what makes pale interface boxes
+show up. Such a box sits about a dozen levels from the white behind it -- 244
+against 255, measured -- so a threshold loose enough to ignore a page whose
+white is a shade off cannot see that box move at all: the text shifts, the box
+says nothing. The second measurement takes the average of each pixel's
+neighbourhood out of the difference first. An overall tint then comes to
+nothing, because it stands out from its surroundings nowhere, while a moved edge
+survives almost whole -- so the second bar can be low enough to catch it. Eight
+levels of tint across the whole page still marks nothing; a pale box a single
+pixel out marks its edge.
+
+An image with a transparent background is compared only where it is drawn: where
+it is see-through what you are looking at is the page, so there is nothing there
+to disagree with. The marks are most trustworthy at 100% zoom, though: scaling
+the image resamples it, and resampling disagrees with itself a little
+everywhere. Text is the other thing to
+expect noise from, since no two renderings of it agree pixel for pixel; the
+anti-aliasing test removes most of that, not all.
+
 **Zoom** scales the image inside the window and leaves the window size alone;
 anything past the edges is clipped and can be panned into view. **1:1** puts it
 at exactly 100%, one image pixel per screen pixel. **Fit** scales it to the
@@ -236,7 +289,8 @@ current window, **Center** undoes panning.
 | `pauzak/history.py` | which recently used images the strip offers |
 | `pauzak/undo.py` | the undo/redo stack, and what merges into one step |
 | `pauzak/snap.py` | edge profiles, and the shift that lines two of them up |
-| `pauzak/align.py` | running one alignment: capture, match off the main loop, apply |
+| `pauzak/diff.py` | the perceptual comparison, and the two colours it paints |
+| `pauzak/scan.py` | reading the screen under an overlay for either of those |
 | `pauzak/backdrop.py` | capturing what is underneath, and why that is the hard part |
 | `tests/behaviour.py` | end-to-end checks against a live X server |
 

@@ -118,10 +118,11 @@ class HistoryStrip(Gtk.ScrolledWindow):
 class OverlayRow(Gtk.ListBoxRow):
     __gtype_name__ = "PauzakOverlayRow"
 
-    def __init__(self, overlay: OverlayWindow, on_close, on_align):
+    def __init__(self, overlay: OverlayWindow, on_close, on_align, on_diff):
         super().__init__()
         self.overlay = overlay
-        self._shown_hidden = None  # the state the row is currently drawn for
+        self._on_diff = on_diff
+        self._shown = None  # the state the row is currently drawn for
 
         box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         box.set_margin_top(6)
@@ -149,14 +150,28 @@ class OverlayRow(Gtk.ListBoxRow):
         self.visibility_button.add_css_class("flat")
         self.visibility_button.add_css_class("pauzak-thumb-button")
         self.visibility_button.set_child(stack)
+
+        # The comparison badge sits over the thumbnail rather than inside its
+        # button, so a click reaches one or the other and not both.
+        self.diff_button = Gtk.ToggleButton(
+            halign=Gtk.Align.START, valign=Gtk.Align.START, can_focus=False
+        )
+        self.diff_button.add_css_class("flat")
+        self.diff_button.add_css_class("pauzak-diff-badge")
+        self.diff_button.set_child(Gtk.Image.new_from_icon_name("view-dual-symbolic"))
+        self.diff_button.connect("toggled", self._on_diff_toggled)
+
+        badges = Gtk.Overlay(valign=Gtk.Align.CENTER)
+        badges.set_child(self.visibility_button)
+        badges.add_overlay(self.diff_button)
         self.visibility_button.connect("toggled", self._on_visibility_toggled)
-        box.append(self.visibility_button)
+        box.append(badges)
 
         label = Gtk.Label(label=overlay.image_name, xalign=0.0, hexpand=True)
         label.set_ellipsize(Pango.EllipsizeMode.END)
         box.append(label)
 
-        box.append(self._menu_button(on_align))
+        box.append(self._menu_button(on_align, on_diff))
 
         close = Gtk.Button(icon_name="window-close-symbolic", valign=Gtk.Align.CENTER)
         close.add_css_class("flat")
@@ -168,12 +183,13 @@ class OverlayRow(Gtk.ListBoxRow):
         overlay.connect("state-changed", lambda _o: self.refresh())
         self.refresh()
 
-    def _menu_button(self, on_align):
+    def _menu_button(self, on_align, on_diff):
         """The row's own menu: what applies to this overlay and nothing else."""
         actions = Gio.SimpleActionGroup()
         for name, run in (
             ("visibility", lambda: self.overlay.set_hidden(not self.overlay.hidden)),
             ("align", on_align),
+            ("diff", on_diff),
         ):
             action = Gio.SimpleAction.new(name, None)
             action.connect("activate", lambda *_args, run=run: run())
@@ -193,22 +209,48 @@ class OverlayRow(Gtk.ListBoxRow):
     def _rebuild_menu(self, hidden: bool) -> None:
         self.menu.remove_all()
         self.menu.append("Show" if hidden else "Hide", "row.visibility")
-        item = Gio.MenuItem.new("Smart snap", "row.align")
-        item.set_attribute_value("accel", GLib.Variant.new_string("<Control><Shift>a"))
-        self.menu.append_item(item)
+        for label, action, accel in (
+            ("Smart snap", "row.align", "<Control><Shift>a"),
+            ("Visual diff", "row.diff", "<Control><Shift>d"),
+        ):
+            item = Gio.MenuItem.new(label, action)
+            item.set_attribute_value("accel", GLib.Variant.new_string(accel))
+            self.menu.append_item(item)
 
     def _on_visibility_toggled(self, button):
+        if self._shown is None:  # mid-refresh, following the overlay
+            return
         self.overlay.set_hidden(button.get_active())
         self.refresh()
 
-    def refresh(self):
-        # Everything here follows from `hidden` alone, and state-changed
-        # arrives once per motion event while a drag is going on.
-        hidden = self.overlay.hidden
-        if hidden == self._shown_hidden:
+    def _on_diff_toggled(self, button):
+        """Off puts the marks away; on brings the same ones back, or reads the
+        screen once if there are none yet."""
+        if self._shown is None:  # mid-refresh, following the overlay
             return
-        self._shown_hidden = hidden
-        self._rebuild_menu(hidden)
+        if button.get_active() == self.overlay.showing_diff():
+            return
+        if self.overlay.toggle_diff():
+            return
+        # Nothing to show yet, so the screen has to be read, which may take a
+        # second or be refused outright. Either way the badge goes back to
+        # saying what is actually on screen; it lights up when marks arrive.
+        self._on_diff()
+        self._shown = None
+        self.refresh()
+
+    def refresh(self):
+        # Everything here follows from these two, and state-changed arrives
+        # once per motion event while a drag is going on.
+        hidden, comparing = self.overlay.hidden, self.overlay.showing_diff()
+        if (hidden, comparing) == self._shown:
+            return
+        was_hidden = self._shown[0] if self._shown is not None else None
+        self._shown = None  # the handlers stand down while the row catches up
+        if hidden != was_hidden:
+            # The menu's wording follows `hidden` and nothing else, and
+            # rebuilding it under an open popover is worth avoiding.
+            self._rebuild_menu(hidden)
         if self.visibility_button.get_active() != hidden:
             self.visibility_button.set_active(hidden)
         self.eye.set_from_icon_name(
@@ -218,6 +260,12 @@ class OverlayRow(Gtk.ListBoxRow):
         self.visibility_button.set_tooltip_text(
             "Show this overlay" if hidden else "Hide this overlay"
         )
+        if self.diff_button.get_active() != comparing:
+            self.diff_button.set_active(comparing)
+        self.diff_button.set_tooltip_text(
+            "Hide the differences" if comparing else "Show the differences (Ctrl+Shift+D)"
+        )
+        self._shown = (hidden, comparing)
 
 
 class ControlWindow(Adw.ApplicationWindow):
@@ -467,6 +515,7 @@ class ControlWindow(Adw.ApplicationWindow):
             ("close-overlay", lambda *_: self._close_overlay(self.selected_overlay())),
             ("toggle-hidden", lambda *_: self._toggle_hidden()),
             ("align", self._action_align),
+            ("diff", self._action_diff),
         ):
             action = Gio.SimpleAction.new(name, None)
             action.connect("activate", handler)
@@ -544,7 +593,8 @@ class ControlWindow(Adw.ApplicationWindow):
         row = OverlayRow(
             overlay,
             self._close_overlay,
-            lambda: self.get_application().aligner.align(overlay),
+            lambda: self.get_application().scanner.align(overlay),
+            lambda: self.get_application().scanner.diff(overlay, fresh=True),
         )
         if index is None:
             self.list_box.append(row)
@@ -805,7 +855,10 @@ class ControlWindow(Adw.ApplicationWindow):
     # -- lining up with what is underneath ---------------------------------
 
     def _action_align(self, *_args):
-        self.get_application().aligner.align(self.selected_overlay())
+        self.get_application().scanner.align(self.selected_overlay())
+
+    def _action_diff(self, *_args):
+        self.get_application().scanner.diff(self.selected_overlay())
 
     def panel_rect(self):
         """Where the panel is, so a scan can refuse to photograph it."""

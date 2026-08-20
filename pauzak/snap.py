@@ -22,11 +22,6 @@ from __future__ import annotations
 
 from typing import NamedTuple
 
-import gi
-
-gi.require_version("Gdk", "4.0")
-from gi.repository import Gdk  # noqa: E402
-
 try:
     import numpy as np
 except ImportError:  # numpy is what makes this cheap; without it, no aligning
@@ -77,11 +72,6 @@ def gray_from_pixbuf(pixbuf) -> "np.ndarray":
     rows = raw[:needed].reshape(height, stride)
     pixels = rows[:, : width * channels].reshape(height, width, channels)
     return _luminance(pixels)
-
-
-def gray_from_texture(texture: Gdk.Texture) -> "np.ndarray | None":
-    pixbuf = Gdk.pixbuf_get_from_texture(texture)
-    return gray_from_pixbuf(pixbuf) if pixbuf is not None else None
 
 
 def align(image_gray, image_rect, window_size, backdrop_gray) -> Alignment:
