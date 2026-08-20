@@ -246,13 +246,20 @@ def _difference(image, rect, size, under):
     return None if result is None else (result, (x, y, width, height))
 
 
-def _scaled_part(image, drawn_w, drawn_h, offset_x, offset_y, width, height):
+def _scaled_part(image, drawn_w, drawn_h, skip_x, skip_y, width, height):
     """The visible piece of the image, scaled as drawn and no further.
 
     Scaling the whole of it first would be a picture the size of the zoom: a
     12 MP photo at 32x is a hundred thousand pixels across, tens of gigabytes
     of it, to read a few hundred thousand pixels out of the middle. This
     renders only the piece the window shows.
+
+    `skip_x`, `skip_y` are how far into the scaled image the visible piece
+    starts. gdk_pixbuf_scale's offsets say where the scaled image is placed in
+    the destination, which is the negative of that: passing them unnegated
+    slides the piece the wrong way by twice the skip, and the comparison then
+    reads the image from the wrong rows -- marks for content that is not
+    there, in a place where nothing differs.
     """
     part = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, True, 8, width, height)
     if part is None:
@@ -264,8 +271,8 @@ def _scaled_part(image, drawn_w, drawn_h, offset_x, offset_y, width, height):
         0,
         width,
         height,
-        offset_x,
-        offset_y,
+        -skip_x,
+        -skip_y,
         drawn_w / max(1, image.get_width()),
         drawn_h / max(1, image.get_height()),
         GdkPixbuf.InterpType.BILINEAR,

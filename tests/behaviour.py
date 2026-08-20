@@ -1138,6 +1138,29 @@ class Suite(PauzakApplication):
         check("a hugely zoomed image is compared over the window, not in full",
               zoomed is not None and zoomed[1] == (0, 0, 800, 600),
               f"{zoomed[1] if zoomed else None}")
+
+        # Panned so its top-left corner is off the window, which is the case
+        # that tells whether the piece being read is the piece being shown: a
+        # flat image agrees with itself however far the sampling slides.
+        square = np.full((200, 200, 4), 255, dtype=np.uint8)
+        square[100:140, 100:140] = (40, 40, 48, 255)
+        under = np.full((100, 120, 4), 255, dtype=np.uint8)
+        under[70:100, 60:100] = (40, 40, 48, 255)  # the same square, as drawn
+        panned = scan._difference(
+            GdkPixbuf.Pixbuf.new_from_bytes(
+                GLib.Bytes.new(square.tobytes()), GdkPixbuf.Colorspace.RGB, True, 8,
+                200, 200, 200 * 4,
+            ),
+            (-40.0, -30.0, 200.0, 200.0),
+            (120, 100),
+            GdkPixbuf.Pixbuf.new_from_bytes(
+                GLib.Bytes.new(under.tobytes()), GdkPixbuf.Colorspace.RGB, True, 8,
+                120, 100, 120 * 4,
+            ),
+        )
+        check("an image panned off the corner is read from where it is drawn",
+              panned is not None and panned[0].coverage == 0.0,
+              f"{panned[0].coverage * 100:.1f}% differs" if panned else "nothing compared")
         return self._then(self.align_setup)
 
     def align_setup(self):
