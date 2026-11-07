@@ -33,6 +33,13 @@ that matches is fully transparent, so the page underneath stays visible and in
 place, and only the disagreements are painted. They are painted in two colours
 rather than one: knowing an edge is out is half the answer, and knowing which
 side has the ink is the other half.
+
+The comparison also hands back a second rendering for the other way of showing
+the marks: the screen drained to grey with the marks composited on, in git's
+colours -- green where the image has the ink, red where the screen has it. Over
+grey being coloured at all is what means difference, and green and red are safe
+there in a way they are not over a live page, where they could be the page's
+own.
 """
 
 from __future__ import annotations
@@ -66,6 +73,12 @@ MIN_ALPHA, MAX_ALPHA = 0.45, 0.92  # how solid a highlight gets, by magnitude
 # ruled out the blue this started as -- it was a near match for a button.
 IMAGE_DARKER = (230, 0, 126)
 SCREEN_DARKER = (255, 212, 0)
+# On the greyed page that worry is gone, so the "diff" style can afford git's
+# pair: green for the image's ink (what the page should gain), red for the
+# screen's (what it has over). Adwaita's green 5 and red 3, the same the
+# guides and the border use.
+IMAGE_DARKER_ON_GREY = (38, 162, 105)
+SCREEN_DARKER_ON_GREY = (224, 27, 36)
 
 _OFFSETS = tuple(
     (dy, dx) for dy in (-1, 0, 1) for dx in (-1, 0, 1) if (dy, dx) != (0, 0)
@@ -82,6 +95,7 @@ _YIQ = (
 class Result(NamedTuple):
     rgba: object  # (h, w, 4) uint8, ready to become a texture
     coverage: float  # fraction of the compared pixels that disagree
+    base: object  # (h, w, 4) uint8: the screen greyed, git-coloured marks baked in
 
 
 def available() -> bool:
@@ -175,7 +189,39 @@ def compare(image_rgb, screen_rgb, threshold: float = THRESHOLD) -> Result | Non
         for channel, value in enumerate(color):
             rgba[:, :, channel][mask] = value
     rgba[:, :, 3][differing] = (alpha[differing] * 255).astype(np.uint8)
-    return Result(rgba, float(differing.mean()))
+    base = _grayscale(screen_rgb)
+    _bake(base, differing, darker_in_image, alpha)
+    return Result(rgba, float(differing.mean()), base)
+
+
+def _grayscale(rgb):
+    """The screen with its colour taken out, for the "diff" style to draw on."""
+    luma = np.clip(
+        sum(weight * rgb[:, :, band] for band, weight in enumerate(_YIQ[0])),
+        0.0,
+        255.0,
+    ).astype(np.uint8)
+    base = np.empty((*luma.shape, 4), dtype=np.uint8)
+    base[:, :, :3] = luma[:, :, None]
+    base[:, :, 3] = 255
+    return base
+
+
+def _bake(base, differing, darker_in_image, alpha):
+    """Composite the marks onto the greyed screen, with the same alphas the
+    transparent layer gets, so a faint disagreement still reads as faint."""
+    for mask, color in (
+        (differing & darker_in_image, IMAGE_DARKER_ON_GREY),
+        (differing & ~darker_in_image, SCREEN_DARKER_ON_GREY),
+    ):
+        if not mask.any():
+            continue
+        weight = alpha[mask][:, None]
+        pixels = base[mask].astype(np.float32)
+        pixels[:, :3] = np.array(color, dtype=np.float32) * weight + pixels[:, :3] * (
+            1.0 - weight
+        )
+        base[mask] = pixels.astype(np.uint8)
 
 
 def _yiq(rgb):

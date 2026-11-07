@@ -172,12 +172,19 @@ class Scanner:
             overlay.clear_diff()
             self._report("No differences worth marking.")
             return GLib.SOURCE_REMOVE
-        # The texture is made here rather than on the worker: it is GDK's.
-        overlay.show_diff(diff.texture_from_rgba(result.rgba), rect, arrangement)
-        self._report(
-            f"{result.coverage * 100:.1f}% differs. Magenta: the image is darker "
-            "there; yellow: the screen is."
+        # The textures are made here rather than on the worker: they are GDK's.
+        overlay.show_diff(
+            diff.texture_from_rgba(result.rgba),
+            rect,
+            arrangement,
+            diff.texture_from_rgba(result.base),
         )
+        palette = (
+            "Green: the image is darker there; red: the screen is."
+            if overlay.view.diff_style == "diff"
+            else "Magenta: the image is darker there; yellow: the screen is."
+        )
+        self._report(f"{result.coverage * 100:.1f}% differs. {palette}")
         return GLib.SOURCE_REMOVE
 
     def _applied(self, overlay, alignment):

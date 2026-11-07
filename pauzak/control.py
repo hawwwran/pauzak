@@ -194,6 +194,13 @@ class OverlayRow(Gtk.ListBoxRow):
             action = Gio.SimpleAction.new(name, None)
             action.connect("activate", lambda *_args, run=run: run())
             actions.add_action(action)
+        style = Gio.SimpleAction.new_stateful(
+            "diff-style",
+            GLib.VariantType.new("s"),
+            GLib.Variant.new_string(self.overlay.view.diff_style),
+        )
+        style.connect("change-state", self._on_diff_style)
+        actions.add_action(style)
         self.insert_action_group("row", actions)
 
         self.menu = Gio.Menu()
@@ -216,6 +223,14 @@ class OverlayRow(Gtk.ListBoxRow):
             item = Gio.MenuItem.new(label, action)
             item.set_attribute_value("accel", GLib.Variant.new_string(accel))
             self.menu.append_item(item)
+        style = Gio.Menu()
+        style.append("Full", "row.diff-style::full")
+        style.append("Differences only", "row.diff-style::diff")
+        self.menu.append_section("Diff style", style)
+
+    def _on_diff_style(self, action, value):
+        action.set_state(value)
+        self.overlay.set_diff_style(value.get_string())
 
     def _on_visibility_toggled(self, button):
         if self._shown is None:  # mid-refresh, following the overlay

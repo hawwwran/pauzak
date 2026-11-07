@@ -81,7 +81,7 @@ Getting an image in, from the control panel:
 | `Ctrl+Shift+D` | shows the differences with what is under the overlay, or puts them away again |
 | click a thumbnail in the list | hides or shows that overlay |
 | the badge at the corner of a thumbnail | shows or puts away that overlay's differences |
-| the ⋯ button on a row | that overlay's own menu: Hide/Show, Smart snap, Visual diff |
+| the ⋯ button on a row | that overlay's own menu: Hide/Show, Smart snap, Visual diff, the diff style |
 | click a thumbnail in the bottom strip | opens a recently used image again |
 
 On the overlay itself:
@@ -237,13 +237,24 @@ the page has moved on. Either way the marks are dropped the moment the image is
 panned or zoomed, or the window moved or resized -- they describe what was under
 one arrangement, and over another they would be a lie.
 
+The marks come in two styles, switched from the ⋯ menu. **Full** lays them
+over the live page as it is. **Differences only** greys the page first and
+paints the marks in git's colours over it, so being coloured at all is what
+means difference -- the style for a page busy enough to hide the marks. The
+grey rendering is part of the reading the marks came from, so switching styles
+does not read the screen again.
+
 Marks come in two colours, because knowing an edge is out is half the answer
 and knowing which way is the other half. **Magenta** is where the image is the
 darker of the two, so usually where the design has ink the page has not caught
 up with; **yellow** is where the screen is darker, usually something the page
-has too much of. A moved edge shows as both, one on each side of it. How solid
-a mark is follows how far apart the two are, so a faint disagreement reads as
-faint. The toast gives the share of pixels that differ.
+has too much of. In the differences-only style the same two are **green** and
+**red**: green for what the page should gain, red for what it has over, as a
+git diff reads. Magenta and yellow hold the full style because interfaces so
+rarely use them that a mark cannot be mistaken for the page's own; over grey
+that worry is gone. A moved edge shows as both colours, one on each side of it.
+How solid a mark is follows how far apart the two are, so a faint disagreement
+reads as faint. The toast gives the share of pixels that differ.
 
 The comparison is perceptual, not arithmetic. A plain subtraction lights up
 every difference in font rendering, every subpixel fringe and every shade of

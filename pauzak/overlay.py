@@ -160,8 +160,9 @@ class ImageView(Gtk.Widget):
         # Guides are snap.Guide values; the view only reads their fields.
         self.guides = ()
         self.scanning = False
-        self.diff = None  # (texture, rect, arrangement) once one has been made
+        self.diff = None  # (texture, rect, arrangement, base) once one has been made
         self.diff_visible = True
+        self.diff_style = "full"  # "diff" shows the greyed screen, marks in git colours
         self.position_source = None  # set by the window; see arrangement()
         self.set_hexpand(True)
         self.set_vexpand(True)
@@ -185,9 +186,12 @@ class ImageView(Gtk.Widget):
             # The image itself is not drawn under a comparison: what the marks
             # are about is the screen, and it has to stay visible. Nor is the
             # opacity slider applied to them -- they are a reading, like the
-            # border and the guides, not tracing paper.
-            texture, rect, _key = marks
-            snapshot.append_texture(texture, Graphene.Rect().init(*rect))
+            # border and the guides, not tracing paper. The "diff" style shows
+            # the other rendering: the greyed screen with the marks baked in,
+            # where colour means difference.
+            texture, rect, _key, base = marks
+            area = Graphene.Rect().init(*rect)
+            snapshot.append_texture(base if self.diff_style == "diff" else texture, area)
         else:
             snapshot.push_opacity(self.image_opacity)
             snapshot.append_scaled_texture(
@@ -213,10 +217,10 @@ class ImageView(Gtk.Widget):
         outline.init_from_rect(Graphene.Rect().init(0, 0, width, height), 0)
         snapshot.append_border(outline, [BORDER_WIDTH] * 4, [self.border_color] * 4)
 
-    def set_diff(self, texture, rect, arrangement) -> None:
+    def set_diff(self, texture, rect, arrangement, base) -> None:
         """`arrangement` is what the marks were measured against, which is not
         necessarily what is on screen by the time they arrive."""
-        self.diff = (texture, rect, arrangement)
+        self.diff = (texture, rect, arrangement, base)
         self.diff_visible = True
         self.queue_draw()
 
@@ -543,8 +547,20 @@ class OverlayWindow(Gtk.Window):
         self.show_guides(alignment.guides)
         self.emit("state-changed")
 
-    def show_diff(self, texture, rect, arrangement) -> None:
-        self.view.set_diff(texture, rect, arrangement)
+    def show_diff(self, texture, rect, arrangement, base) -> None:
+        self.view.set_diff(texture, rect, arrangement, base)
+        self.emit("state-changed")
+
+    def set_diff_style(self, style: str) -> None:
+        """"full" lays the marks on the live page; "diff" greys the page first.
+
+        Like the marks themselves this is a way of reading, not a change to the
+        overlay, so undo hears nothing about it.
+        """
+        if style == self.view.diff_style:
+            return
+        self.view.diff_style = style
+        self.view.queue_draw()
         self.emit("state-changed")
 
     def clear_diff(self) -> None:

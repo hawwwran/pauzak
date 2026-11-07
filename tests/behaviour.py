@@ -1053,6 +1053,21 @@ class Suite(PauzakApplication):
         check("and the marks cover where it is and where it should be",
               marked.size > 0 and marked.min() <= 101 and marked.max() >= 105,
               f"columns {list(marked[:1]) + list(marked[-1:])}")
+        agree = moved.rgba[:, :, 3] == 0
+        greys = moved.base[agree]
+        check("the diff style's rendering is grey wherever the two agree",
+              moved.base.shape == moved.rgba.shape
+              and bool((greys[:, 0] == greys[:, 1]).all())
+              and bool((greys[:, 1] == greys[:, 2]).all())
+              and bool((moved.base[:, :, 3] == 255).all()),
+              f"{moved.base.shape}")
+        red = moved.base[:, :, 0].astype(int)
+        green = moved.base[:, :, 1].astype(int)
+        check("green where the image has the ink, red where the screen has it",
+              bool(((green > red + 20) & ~agree).any())
+              and bool(((red > green + 20) & ~agree).any()),
+              f"green={((green > red + 20) & ~agree).sum()} "
+              f"red={((red > green + 20) & ~agree).sum()}")
 
         # Both sides of a moved edge, so which way it is out can be read off.
         one_sided = diff.compare(design, page((106,), (20, 80)))
@@ -1375,6 +1390,15 @@ class Suite(PauzakApplication):
         check("turning it back on shows them again", self.aligned.showing_diff())
         check("and they are the very same marks, not a second reading",
               self.aligned.view.diff[0] is self.diff_texture)
+        check("marks start on the full style", self.aligned.view.diff_style == "full")
+        row.activate_action("row.diff-style", GLib.Variant.new_string("diff"))
+        check("the menu switches the style without a second reading",
+              self.aligned.view.diff_style == "diff"
+              and self.aligned.view.diff[0] is self.diff_texture)
+        check("with the git-coloured rendering there to draw",
+              self.aligned.view.diff[3] is not None)
+        row.activate_action("row.diff-style", GLib.Variant.new_string("full"))
+        check("and switches it back", self.aligned.view.diff_style == "full")
         return self._then(self.diff_fresh, 300)
 
     def diff_fresh(self):
